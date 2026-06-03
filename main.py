@@ -1,3 +1,4 @@
+import asyncio
 import os
 import secrets
 import urllib.parse
@@ -5,10 +6,11 @@ from pathlib import Path
 
 import httpx
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
+from analysis import analyze_preview, load_cache, save_cache
 from spotify import build_track_library
 
 load_dotenv()
@@ -24,10 +26,10 @@ SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 
 app = FastAPI(title="Spoto DJ")
 
-# In-memory token store (keyed by session id cookie)
 _sessions: dict[str, dict] = {}
-# In-memory track cache (keyed by access token)
 _track_cache: dict[str, list[dict]] = {}
+_pending_states: set[str] = set()
+_analysis_state: dict = {"running": False, "total": 0, "done": 0, "results": {}}
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -43,6 +45,27 @@ def _get_session(request: Request) -> dict:
     return _sessions.get(sid, {}) if sid else {}
 
 
+async def _run_analysis(tracks: list[dict], cache: dict):
+    semaphore = asyncio.Semaphore(5)
+    tasks = [
+        analyze_preview(t["id"], t["preview_url"], semaphore)
+        for t in tracks
+    ]
+
+    for i, coro in enumerate(asyncio.as_completed(tasks)):
+        track_id, result = await coro
+        if "error" not in result:
+            cache[track_id] = result
+            _analysis_state["results"][track_id] = result
+        _analysis_state["done"] += 1
+        # Persist cache every 20 tracks
+        if _analysis_state["done"] % 20 == 0:
+            save_cache(cache)
+
+    save_cache(cache)
+    _analysis_state["running"] = False
+
+
 @app.get("/", response_class=HTMLResponse)
 async def index():
     return (static_dir / "index.html").read_text()
@@ -51,6 +74,7 @@ async def index():
 @app.get("/login")
 async def login():
     state = secrets.token_urlsafe(16)
+    _pending_states.add(state)
     params = {
         "client_id": CLIENT_ID,
         "response_type": "code",
@@ -59,9 +83,7 @@ async def login():
         "state": state,
     }
     url = f"{SPOTIFY_AUTH_URL}?{urllib.parse.urlencode(params)}"
-    response = RedirectResponse(url)
-    response.set_cookie("oauth_state", state, httponly=True, samesite="lax", max_age=300)
-    return response
+    return RedirectResponse(url)
 
 
 @app.get("/callback")
@@ -69,9 +91,9 @@ async def callback(request: Request, code: str = "", state: str = "", error: str
     if error:
         raise HTTPException(400, f"Spotify auth error: {error}")
 
-    stored_state = request.cookies.get("oauth_state")
-    if not stored_state or stored_state != state:
+    if state not in _pending_states:
         raise HTTPException(400, "State mismatch — possible CSRF")
+    _pending_states.discard(state)
 
     async with httpx.AsyncClient() as client:
         resp = await client.post(
@@ -89,7 +111,6 @@ async def callback(request: Request, code: str = "", state: str = "", error: str
     session_id = secrets.token_urlsafe(32)
     response = RedirectResponse("/")
     _set_session(response, session_id, token_data)
-    response.delete_cookie("oauth_state")
     return response
 
 
@@ -114,6 +135,54 @@ async def tracks(request: Request):
     library = await build_track_library(access_token)
     _track_cache[access_token] = library
     return JSONResponse({"tracks": library, "cached": False})
+
+
+@app.post("/api/analyze")
+async def start_analyze(request: Request, background_tasks: BackgroundTasks):
+    session = _get_session(request)
+    access_token = session.get("access_token")
+    if not access_token:
+        raise HTTPException(401, "Not authenticated")
+
+    if _analysis_state["running"]:
+        return JSONResponse({"status": "already_running"})
+
+    library = _track_cache.get(access_token, [])
+    if not library:
+        raise HTTPException(400, "Load tracks first via /api/tracks")
+
+    cache = load_cache()
+    # Seed results with already-cached data
+    _analysis_state["results"] = dict(cache)
+
+    to_analyze = [t for t in library if t.get("preview_url") and t["id"] not in cache]
+
+    _analysis_state.update({
+        "running": True,
+        "total": len(to_analyze),
+        "done": 0,
+    })
+
+    if to_analyze:
+        background_tasks.add_task(_run_analysis, to_analyze, cache)
+    else:
+        _analysis_state["running"] = False
+
+    return JSONResponse({
+        "status": "started",
+        "total": len(to_analyze),
+        "cached": len(cache),
+    })
+
+
+@app.get("/api/analyze/status")
+async def analyze_status():
+    return JSONResponse({
+        "running": _analysis_state["running"],
+        "done": _analysis_state["done"],
+        "total": _analysis_state["total"],
+        "results": _analysis_state["results"],
+    })
 
 
 @app.get("/logout")
