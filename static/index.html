@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Spoto DJ</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div class="header-inner">
+      <h1>🎧 Spoto DJ</h1>
+      <div id="auth-area">
+        <button id="login-btn" class="btn-primary" onclick="location.href='/login'">Connect Spotify</button>
+        <button id="logout-btn" class="btn-ghost" onclick="location.href='/logout'" style="display:none">Logout</button>
+      </div>
+    </div>
+  </header>
+
+  <main>
+    <section id="welcome" class="center-card">
+      <h2>Your DJ library, analysed</h2>
+      <p>Connect your Spotify account to see all your liked songs with DJ-ready metadata: BPM, Camelot key, energy, genre, danceability, loudness, and more.</p>
+      <button class="btn-primary big" onclick="location.href='/login'">Connect Spotify</button>
+    </section>
+
+    <section id="loading" style="display:none" class="center-card">
+      <div class="spinner"></div>
+      <p id="loading-msg">Fetching your library…</p>
+    </section>
+
+    <section id="library" style="display:none">
+      <div class="toolbar">
+        <input id="search" type="text" placeholder="Search title, artist, genre…" oninput="applyFilters()" />
+        <div class="filters">
+          <label>Min BPM <input id="bpm-min" type="number" placeholder="60" min="0" max="300" oninput="applyFilters()" /></label>
+          <label>Max BPM <input id="bpm-max" type="number" placeholder="200" min="0" max="300" oninput="applyFilters()" /></label>
+          <label>Key
+            <select id="key-filter" onchange="applyFilters()">
+              <option value="">All keys</option>
+            </select>
+          </label>
+          <label>Min Energy
+            <input id="energy-min" type="number" placeholder="0" min="0" max="100" oninput="applyFilters()" />
+          </label>
+        </div>
+        <div class="toolbar-right">
+          <span id="track-count" class="muted"></span>
+          <button class="btn-ghost small" onclick="exportCSV()">Export CSV</button>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table id="track-table">
+          <thead>
+            <tr>
+              <th></th>
+              <th data-col="title" onclick="sortBy('title')">Title <span class="sort-icon">⇅</span></th>
+              <th data-col="artists" onclick="sortBy('artists')">Artists <span class="sort-icon">⇅</span></th>
+              <th data-col="genres">Genres</th>
+              <th data-col="bpm" onclick="sortBy('bpm')">BPM <span class="sort-icon">⇅</span></th>
+              <th data-col="camelot" onclick="sortBy('camelot')">Camelot <span class="sort-icon">⇅</span></th>
+              <th data-col="key">Key</th>
+              <th data-col="energy" onclick="sortBy('energy')">Energy <span class="sort-icon">⇅</span></th>
+              <th data-col="danceability" onclick="sortBy('danceability')">Dance <span class="sort-icon">⇅</span></th>
+              <th data-col="valence" onclick="sortBy('valence')">Valence <span class="sort-icon">⇅</span></th>
+              <th data-col="loudness" onclick="sortBy('loudness')">dB <span class="sort-icon">⇅</span></th>
+              <th data-col="year" onclick="sortBy('year')">Year <span class="sort-icon">⇅</span></th>
+              <th data-col="duration">Duration</th>
+              <th data-col="popularity" onclick="sortBy('popularity')">Pop <span class="sort-icon">⇅</span></th>
+            </tr>
+          </thead>
+          <tbody id="track-tbody"></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
