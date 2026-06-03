@@ -42,39 +42,63 @@ async function loadTracks() {
 }
 
 async function startAnalysis() {
-  const res = await fetch("/api/analyze", { method: "POST" });
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch("/api/analyze", { method: "POST" });
+    if (!res.ok) { console.warn("analyze endpoint error", res.status); return; }
+    data = await res.json();
+  } catch (e) {
+    console.warn("startAnalysis fetch failed", e);
+    return;
+  }
 
+  console.log("analyze response:", data);
   const banner = document.getElementById("analysis-banner");
   banner.style.display = "";
 
   if (data.total === 0) {
-    // Nothing new to analyze — fetch status to apply cached results
+    // Apply whatever is already cached, then show a summary and hide.
     const statusRes = await fetch("/api/analyze/status");
     const status = await statusRes.json();
     applyAnalysisResults(status.results);
-    banner.style.display = "none";
+
+    const cached = Object.keys(status.results).length;
+    if (cached > 0) {
+      setBannerMsg(`${cached} canciones cargadas desde caché`, 100);
+    } else if (data.no_preview > 0) {
+      setBannerMsg(`${data.no_preview} canciones sin preview de audio (Spotify no provee muestras)`, 100);
+    } else {
+      setBannerMsg("Sin canciones para analizar", 100);
+    }
+    setTimeout(() => { banner.style.display = "none"; }, 4000);
     return;
   }
 
-  updateBanner(0, data.total);
+  setBannerMsg(`Analizando audio… 0 / ${data.total} canciones`, 0);
   pollTimer = setInterval(pollAnalysis, 2000);
 }
 
 async function pollAnalysis() {
-  const res = await fetch("/api/analyze/status");
-  const data = await res.json();
+  let data;
+  try {
+    const res = await fetch("/api/analyze/status");
+    data = await res.json();
+  } catch (e) {
+    console.warn("pollAnalysis fetch failed", e);
+    return;
+  }
 
   applyAnalysisResults(data.results);
-  updateBanner(data.done, data.total);
+  const pct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 100;
+  setBannerMsg(`Analizando audio… ${data.done} / ${data.total} canciones`, pct);
 
   if (!data.running) {
     clearInterval(pollTimer);
     pollTimer = null;
+    setBannerMsg(`Análisis completo: ${data.done} canciones procesadas`, 100);
     setTimeout(() => {
       document.getElementById("analysis-banner").style.display = "none";
-    }, 2000);
-    // Refresh key filter with newly discovered keys
+    }, 3000);
     const sel = document.getElementById("key-filter");
     sel.innerHTML = '<option value="">All keys</option>';
     populateKeyFilter();
@@ -86,7 +110,7 @@ function applyAnalysisResults(results) {
   let changed = false;
   allTracks.forEach(t => {
     const r = results[t.id];
-    if (r && t.bpm === 0) {
+    if (r && !r.error && t.bpm === 0) {
       t.bpm = r.bpm;
       t.key = r.key;
       t.camelot = r.camelot;
@@ -94,15 +118,11 @@ function applyAnalysisResults(results) {
       changed = true;
     }
   });
-  if (changed) {
-    applyFilters();
-  }
+  if (changed) applyFilters();
 }
 
-function updateBanner(done, total) {
-  const pct = total > 0 ? Math.round((done / total) * 100) : 100;
-  document.getElementById("analysis-msg").textContent =
-    `Analizando audio… ${done} / ${total} canciones`;
+function setBannerMsg(msg, pct) {
+  document.getElementById("analysis-msg").textContent = msg;
   document.getElementById("analysis-progress").style.width = `${pct}%`;
 }
 
