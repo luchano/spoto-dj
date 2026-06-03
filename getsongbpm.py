@@ -12,7 +12,7 @@ from analysis import CAMELOT, KEY_NAMES
 
 log = logging.getLogger("spoto.getsongbpm")
 
-_BASE = "https://api.getsongbpm.com"
+_BASE = "https://api.getsong.co"
 
 # Map note names (including enharmonics) to pitch class 0-11
 _NOTE = {
