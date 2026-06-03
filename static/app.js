@@ -1,7 +1,8 @@
 let allTracks = [];
 let filtered = [];
 let sortCol = "added_at";
-let sortDir = -1; // -1 = desc, 1 = asc
+let sortDir = -1;
+let pollTimer = null;
 
 async function init() {
   const res = await fetch("/api/me");
@@ -21,19 +22,92 @@ async function loadTracks() {
   try {
     const res = await fetch("/api/tracks");
     if (res.status === 401) { location.href = "/login"; return; }
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ detail: res.statusText }));
+      document.getElementById("loading-msg").textContent = `Error ${res.status}: ${err.detail}`;
+      return;
+    }
     const data = await res.json();
     allTracks = data.tracks;
     populateKeyFilter();
     applyFilters();
     document.getElementById("loading").style.display = "none";
     document.getElementById("library").style.display = "";
+
+    // Start analysis if any track is missing BPM — backend decides what needs work
+    if (allTracks.some(t => t.bpm === 0)) startAnalysis();
   } catch (e) {
-    document.getElementById("loading-msg").textContent = "Error loading tracks. Please refresh.";
+    document.getElementById("loading-msg").textContent = `Error: ${e.message}`;
   }
 }
 
+async function startAnalysis() {
+  const res = await fetch("/api/analyze", { method: "POST" });
+  const data = await res.json();
+
+  const banner = document.getElementById("analysis-banner");
+  banner.style.display = "";
+
+  if (data.total === 0) {
+    // Nothing new to analyze — fetch status to apply cached results
+    const statusRes = await fetch("/api/analyze/status");
+    const status = await statusRes.json();
+    applyAnalysisResults(status.results);
+    banner.style.display = "none";
+    return;
+  }
+
+  updateBanner(0, data.total);
+  pollTimer = setInterval(pollAnalysis, 2000);
+}
+
+async function pollAnalysis() {
+  const res = await fetch("/api/analyze/status");
+  const data = await res.json();
+
+  applyAnalysisResults(data.results);
+  updateBanner(data.done, data.total);
+
+  if (!data.running) {
+    clearInterval(pollTimer);
+    pollTimer = null;
+    setTimeout(() => {
+      document.getElementById("analysis-banner").style.display = "none";
+    }, 2000);
+    // Refresh key filter with newly discovered keys
+    const sel = document.getElementById("key-filter");
+    sel.innerHTML = '<option value="">All keys</option>';
+    populateKeyFilter();
+  }
+}
+
+function applyAnalysisResults(results) {
+  if (!results || !Object.keys(results).length) return;
+  let changed = false;
+  allTracks.forEach(t => {
+    const r = results[t.id];
+    if (r && t.bpm === 0) {
+      t.bpm = r.bpm;
+      t.key = r.key;
+      t.camelot = r.camelot;
+      t.energy = r.energy;
+      changed = true;
+    }
+  });
+  if (changed) {
+    applyFilters();
+  }
+}
+
+function updateBanner(done, total) {
+  const pct = total > 0 ? Math.round((done / total) * 100) : 100;
+  document.getElementById("analysis-msg").textContent =
+    `Analizando audio… ${done} / ${total} canciones`;
+  document.getElementById("analysis-progress").style.width = `${pct}%`;
+}
+
 function populateKeyFilter() {
-  const keys = [...new Set(allTracks.map(t => t.key).filter(Boolean))].sort();
+  const keys = [...new Set(allTracks.map(t => t.key).filter(k => k && k !== "?"))].sort();
   const sel = document.getElementById("key-filter");
   keys.forEach(k => {
     const opt = document.createElement("option");
@@ -119,8 +193,8 @@ function renderTable() {
       <td style="max-width:160px">${esc(t.artists)}</td>
       <td style="max-width:180px">${genres || '<span class="muted">—</span>'}</td>
       <td><strong>${t.bpm || "—"}</strong></td>
-      <td>${t.camelot !== "?" ? camelotBadge(t.camelot) : '<span class="muted">—</span>'}</td>
-      <td style="color:var(--muted);font-size:12px">${t.key || "—"}</td>
+      <td>${t.camelot && t.camelot !== "?" ? camelotBadge(t.camelot) : '<span class="muted">—</span>'}</td>
+      <td style="color:var(--muted);font-size:12px">${t.key && t.key !== "?" ? t.key : "—"}</td>
       ${barCell(t.energy, "energy")}
       ${barCell(t.danceability, "dance")}
       ${barCell(t.valence, "valence")}
