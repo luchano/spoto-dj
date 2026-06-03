@@ -85,8 +85,11 @@ async def _search(
     lookup: str,
     search_type: str = "both",
     limit: int = 5,
-) -> list[dict]:
-    """Call /search/ and return the list of results (empty on error)."""
+) -> Optional[list]:
+    """Call /search/ and return:
+    - list of songs  →  results (may be empty list = "no results from API")
+    - None           →  transient error (HTTP non-200, network) — do NOT cache as not-found
+    """
     async with semaphore:
         for attempt in range(3):
             try:
@@ -101,16 +104,17 @@ async def _search(
                     await asyncio.sleep(wait)
                     continue
                 if resp.status_code != 200:
-                    return []
+                    log.warning("Search HTTP %d for %r", resp.status_code, lookup)
+                    return None  # transient/API error — not the same as "not found"
                 search = resp.json().get("search")
                 # API returns a dict like {"error": "no result"} when nothing found
                 return search if isinstance(search, list) else []
             except Exception as exc:
                 if attempt == 2:
-                    log.debug("Search error: %s", exc)
-                    return []
+                    log.warning("Search network error for %r: %s", lookup, exc)
+                    return None  # network error — transient
                 await asyncio.sleep(1 << attempt)
-    return []
+    return None
 
 
 async def lookup_track(
@@ -135,30 +139,40 @@ async def lookup_track(
     clean = _clean_title(title)
     first_artist = artists[0] if artists else ""
 
+    api_responded = False  # True once we get at least one HTTP 200
+
     # --- Pass 1: targeted search ---
     lookup_both = f"song:{clean} artist:{first_artist}"
-    results = await _search(api_key, client, semaphore, lookup_both, search_type="both", limit=3)
-    if results:
-        parsed = _parse_song(results[0])
-        if parsed:
-            log.debug("Found (both) %s - %s", title, first_artist)
-            return track_id, parsed
-
-    # --- Pass 2: title-only search, filter by artist ---
-    results = await _search(api_key, client, semaphore, clean, search_type="song", limit=10)
-    for song in results:
-        gsa = (song.get("artist") or {}).get("name", "")
-        if _artist_match(artists, gsa):
-            parsed = _parse_song(song)
+    r1 = await _search(api_key, client, semaphore, lookup_both, search_type="both", limit=3)
+    if r1 is not None:
+        api_responded = True
+        if r1:
+            parsed = _parse_song(r1[0])
             if parsed:
-                log.debug("Found (artist match) %s - %s", title, gsa)
+                log.debug("Found (both) %s - %s", title, first_artist)
                 return track_id, parsed
 
-    # --- Pass 3: take first result regardless of artist ---
-    for song in results:
-        parsed = _parse_song(song)
-        if parsed:
-            log.debug("Found (first result) %s", title)
-            return track_id, parsed
+    # --- Pass 2: title-only search, filter by artist ---
+    r2 = await _search(api_key, client, semaphore, clean, search_type="song", limit=10)
+    if r2 is not None:
+        api_responded = True
+        for song in r2:
+            gsa = (song.get("artist") or {}).get("name", "")
+            if _artist_match(artists, gsa):
+                parsed = _parse_song(song)
+                if parsed:
+                    log.debug("Found (artist match) %s - %s", title, gsa)
+                    return track_id, parsed
+
+        # --- Pass 3: take first result regardless of artist ---
+        for song in r2:
+            parsed = _parse_song(song)
+            if parsed:
+                log.debug("Found (first result) %s", title)
+                return track_id, parsed
+
+    if not api_responded:
+        # All searches failed with HTTP errors — transient, don't cache
+        return track_id, {"error": "api error (transient)"}
 
     return track_id, {"error": f"not found: {title!r}"}
