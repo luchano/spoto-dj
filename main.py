@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from analysis import load_cache, save_cache
-from getsongbpm import lookup_by_spotify_id
+from getsongbpm import lookup_track
 from spotify import build_track_library
 
 log = logging.getLogger("spoto")
@@ -58,10 +58,14 @@ async def _run_analysis(tracks: list[dict], cache: dict):
 
     async def _lookup(track: dict):
         async with httpx.AsyncClient() as client:
-            result = await lookup_by_spotify_id(
-                GETSONGBPM_API_KEY, track["id"], client, semaphore
+            return await lookup_track(
+                GETSONGBPM_API_KEY,
+                track["id"],
+                track.get("title", ""),
+                track.get("artists", []),
+                client,
+                semaphore,
             )
-        return track["id"], result
 
     tasks = [asyncio.create_task(_lookup(t)) for t in tracks]
 
