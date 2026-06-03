@@ -19,6 +19,13 @@ log = logging.getLogger("spoto.getsongbpm")
 
 _BASE = "https://api.getsong.co"
 
+# Sentinel returned by _search when the API quota is exceeded.
+# Distinct from None (network error) and [] (no results).
+class _QuotaExceeded:
+    pass
+
+QUOTA_EXCEEDED = _QuotaExceeded()
+
 # Map note names (including enharmonics) to pitch class 0-11
 _NOTE = {
     "C": 0, "C#": 1, "Db": 1, "D": 2, "D#": 3, "Eb": 3,
@@ -85,10 +92,11 @@ async def _search(
     lookup: str,
     search_type: str = "both",
     limit: int = 5,
-) -> Optional[list]:
+):
     """Call /search/ and return:
-    - list of songs  →  results (may be empty list = "no results from API")
-    - None           →  transient error (HTTP non-200, network) — do NOT cache as not-found
+    - list          → results ([] = genuinely not found)
+    - None          → transient error (network / HTTP 5xx) — don't cache
+    - QUOTA_EXCEEDED → API quota hit — caller must stop all requests
     """
     async with semaphore:
         for attempt in range(3):
@@ -103,16 +111,20 @@ async def _search(
                     log.warning("Rate limited — waiting %ds", wait)
                     await asyncio.sleep(wait)
                     continue
+                # 402/401/403 = quota exceeded or key blocked
+                if resp.status_code in (401, 402, 403):
+                    log.error("API quota/auth error: HTTP %d — stopping requests", resp.status_code)
+                    return QUOTA_EXCEEDED
                 if resp.status_code != 200:
                     log.warning("Search HTTP %d for %r", resp.status_code, lookup)
-                    return None  # transient/API error — not the same as "not found"
+                    return None  # other transient error
                 search = resp.json().get("search")
                 # API returns a dict like {"error": "no result"} when nothing found
                 return search if isinstance(search, list) else []
             except Exception as exc:
                 if attempt == 2:
                     log.warning("Search network error for %r: %s", lookup, exc)
-                    return None  # network error — transient
+                    return None
                 await asyncio.sleep(1 << attempt)
     return None
 
@@ -144,6 +156,8 @@ async def lookup_track(
     # --- Pass 1: targeted search ---
     lookup_both = f"song:{clean} artist:{first_artist}"
     r1 = await _search(api_key, client, semaphore, lookup_both, search_type="both", limit=3)
+    if isinstance(r1, _QuotaExceeded):
+        return track_id, {"error": "quota exceeded"}
     if r1 is not None:
         api_responded = True
         if r1:
@@ -154,6 +168,8 @@ async def lookup_track(
 
     # --- Pass 2: title-only search, filter by artist ---
     r2 = await _search(api_key, client, semaphore, clean, search_type="song", limit=10)
+    if isinstance(r2, _QuotaExceeded):
+        return track_id, {"error": "quota exceeded"}
     if r2 is not None:
         api_responded = True
         for song in r2:
@@ -172,7 +188,6 @@ async def lookup_track(
                 return track_id, parsed
 
     if not api_responded:
-        # All searches failed with HTTP errors — transient, don't cache
         return track_id, {"error": "api error (transient)"}
 
     return track_id, {"error": f"not found: {title!r}"}

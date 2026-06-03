@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from analysis import load_cache, save_cache
-from getsongbpm import lookup_track
+from getsongbpm import lookup_track, QUOTA_EXCEEDED as _GETSONGBPM_QUOTA
 from spotify import build_track_library
 
 log = logging.getLogger("spoto")
@@ -76,7 +76,17 @@ async def _run_analysis(tracks: list[dict], cache: dict):
     errors = 0
     for coro in asyncio.as_completed(tasks):
         track_id, result = await coro
-        if "error" in result:
+        if result.get("error") == "quota exceeded":
+            log.error(
+                "API quota exceeded after %d/%d tracks — stopping. "
+                "Remaining tracks will be retried next session.",
+                _analysis_state["done"], len(tracks),
+            )
+            for t in tasks:
+                t.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            break
+        elif "error" in result:
             errors += 1
             msg = result["error"]
             log.warning("Lookup failed %s: %s", track_id, msg)
