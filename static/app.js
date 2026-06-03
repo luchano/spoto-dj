@@ -74,7 +74,7 @@ async function startAnalysis() {
     return;
   }
 
-  setBannerMsg(`Analizando audio… 0 / ${data.total} canciones`, 0);
+  setBannerMsg(`Buscando metadatos… 0 / ${data.total} canciones`, 0);
   pollTimer = setInterval(pollAnalysis, 2000);
 }
 
@@ -95,7 +95,7 @@ async function pollAnalysis() {
   if (!data.running) {
     clearInterval(pollTimer);
     pollTimer = null;
-    setBannerMsg(`Análisis completo: ${data.done} canciones procesadas`, 100);
+    setBannerMsg(`Metadatos cargados: ${Object.keys(data.results).length} canciones`, 100);
     setTimeout(() => {
       document.getElementById("analysis-banner").style.display = "none";
     }, 3000);

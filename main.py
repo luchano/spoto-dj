@@ -11,7 +11,8 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from analysis import analyze_preview, load_cache, save_cache
+from analysis import load_cache, save_cache
+from getsongbpm import lookup_by_spotify_id
 from spotify import build_track_library
 
 log = logging.getLogger("spoto")
@@ -23,6 +24,7 @@ CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "")
 CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8000/callback")
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
+GETSONGBPM_API_KEY = os.getenv("GETSONGBPM_API_KEY", "")
 
 SCOPES = "user-library-read"
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
@@ -50,30 +52,36 @@ def _get_session(request: Request) -> dict:
 
 
 async def _run_analysis(tracks: list[dict], cache: dict):
-    log.info("Analysis started: %d tracks to process", len(tracks))
-    semaphore = asyncio.Semaphore(5)
-    tasks = [
-        analyze_preview(t["id"], t["preview_url"], semaphore)
-        for t in tracks
-    ]
+    log.info("Analysis started: %d tracks via GetSongBPM", len(tracks))
+    # 2 concurrent requests — conservative for free-tier rate limits
+    semaphore = asyncio.Semaphore(2)
+
+    async def _lookup(track: dict):
+        async with httpx.AsyncClient() as client:
+            result = await lookup_by_spotify_id(
+                GETSONGBPM_API_KEY, track["id"], client, semaphore
+            )
+        return track["id"], result
+
+    tasks = [asyncio.create_task(_lookup(t)) for t in tracks]
 
     errors = 0
     for coro in asyncio.as_completed(tasks):
         track_id, result = await coro
         if "error" in result:
             errors += 1
-            log.warning("Analysis failed for %s: %s", track_id, result["error"])
+            log.warning("Lookup failed %s: %s", track_id, result["error"])
         else:
             cache[track_id] = result
             _analysis_state["results"][track_id] = result
         _analysis_state["done"] += 1
-        if _analysis_state["done"] % 20 == 0:
+        if _analysis_state["done"] % 50 == 0:
             save_cache(cache)
             log.info("Progress: %d/%d (errors: %d)", _analysis_state["done"], len(tracks), errors)
 
     save_cache(cache)
     _analysis_state["running"] = False
-    log.info("Analysis complete: %d/%d succeeded, %d errors", len(tracks) - errors, len(tracks), errors)
+    log.info("Done: %d/%d found, %d errors", len(tracks) - errors, len(tracks), errors)
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -161,16 +169,16 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
     if not library:
         raise HTTPException(400, "Load tracks first via /api/tracks")
 
+    if not GETSONGBPM_API_KEY:
+        raise HTTPException(503, "GETSONGBPM_API_KEY not configured")
+
     cache = load_cache()
     _analysis_state["results"] = dict(cache)
-
-    has_preview = [t for t in library if t.get("preview_url")]
-    no_preview = len(library) - len(has_preview)
-    to_analyze = [t for t in has_preview if t["id"] not in cache]
+    to_analyze = [t for t in library if t["id"] not in cache]
 
     log.info(
-        "Analyze request: %d total, %d have preview, %d cached, %d to analyze, %d no preview",
-        len(library), len(has_preview), len(cache), len(to_analyze), no_preview,
+        "Analyze request: %d total, %d cached, %d to look up via GetSongBPM",
+        len(library), len(cache), len(to_analyze),
     )
 
     _analysis_state.update({
@@ -188,7 +196,6 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
         "status": "started",
         "total": len(to_analyze),
         "cached": len(cache),
-        "no_preview": no_preview,
     })
 
 
