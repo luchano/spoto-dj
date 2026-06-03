@@ -102,7 +102,9 @@ async def _search(
                     continue
                 if resp.status_code != 200:
                     return []
-                return resp.json().get("search") or []
+                search = resp.json().get("search")
+                # API returns a dict like {"error": "no result"} when nothing found
+                return search if isinstance(search, list) else []
             except Exception as exc:
                 if attempt == 2:
                     log.debug("Search error: %s", exc)
@@ -126,6 +128,10 @@ async def lookup_track(
     2. type=song  →  <clean_title>  then filter by artist match
     3. type=song  →  <clean_title>  take first result (last resort)
     """
+    # artists may come in as a comma-separated string from the Spotify cache
+    if isinstance(artists, str):
+        artists = [a.strip() for a in artists.split(",") if a.strip()]
+
     clean = _clean_title(title)
     first_artist = artists[0] if artists else ""
 
