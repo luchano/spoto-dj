@@ -69,12 +69,19 @@ async def _run_analysis(tracks: list[dict], cache: dict):
 
     tasks = [asyncio.create_task(_lookup(t)) for t in tracks]
 
+    # Permanent errors worth caching so we don't waste API calls on retries.
+    # Transient errors (quota, network, HTTP 5xx) are NOT cached → retried next session.
+    _PERMANENT = ("not found", "incomplete data")
+
     errors = 0
     for coro in asyncio.as_completed(tasks):
         track_id, result = await coro
         if "error" in result:
             errors += 1
-            log.warning("Lookup failed %s: %s", track_id, result["error"])
+            msg = result["error"]
+            log.warning("Lookup failed %s: %s", track_id, msg)
+            if any(msg.startswith(p) for p in _PERMANENT):
+                cache[track_id] = result   # cache so we skip next time
         else:
             cache[track_id] = result
             _analysis_state["results"][track_id] = result
@@ -177,12 +184,14 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
         raise HTTPException(503, "GETSONGBPM_API_KEY not configured")
 
     cache = load_cache()
-    _analysis_state["results"] = dict(cache)
+    _analysis_state["results"] = {k: v for k, v in cache.items() if "error" not in v}
     to_analyze = [t for t in library if t["id"] not in cache]
 
+    cached_ok = sum(1 for v in cache.values() if "error" not in v)
+    cached_err = len(cache) - cached_ok
     log.info(
-        "Analyze request: %d total, %d cached, %d to look up via GetSongBPM",
-        len(library), len(cache), len(to_analyze),
+        "Analyze request: %d total, %d cached ok, %d cached not-found, %d to look up",
+        len(library), cached_ok, cached_err, len(to_analyze),
     )
 
     _analysis_state.update({
