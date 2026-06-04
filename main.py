@@ -13,6 +13,10 @@ from fastapi.staticfiles import StaticFiles
 
 from analysis import load_cache, save_cache
 from getsongbpm import lookup_track, QUOTA_EXCEEDED as _GETSONGBPM_QUOTA
+from playlist_engine import (
+    create_playlist, delete_playlist, generate as generate_playlist,
+    load_playlists, save_playlists,
+)
 from spotify import build_track_library
 
 log = logging.getLogger("spoto")
@@ -26,7 +30,7 @@ REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8000/callback
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 GETSONGBPM_API_KEY = os.getenv("GETSONGBPM_API_KEY", "")
 
-SCOPES = "user-library-read"
+SCOPES = "user-library-read playlist-modify-public playlist-modify-private"
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
 
@@ -147,6 +151,15 @@ async def callback(request: Request, code: str = "", state: str = "", error: str
         resp.raise_for_status()
         token_data = resp.json()
 
+    # Fetch Spotify user ID for playlist export
+    async with httpx.AsyncClient() as client:
+        me_resp = await client.get(
+            "https://api.spotify.com/v1/me",
+            headers={"Authorization": f"Bearer {token_data['access_token']}"},
+        )
+        if me_resp.status_code == 200:
+            token_data["spotify_user_id"] = me_resp.json().get("id", "")
+
     session_id = secrets.token_urlsafe(32)
     response = RedirectResponse("/")
     _set_session(response, session_id, token_data)
@@ -158,7 +171,10 @@ async def me(request: Request):
     session = _get_session(request)
     if not session.get("access_token"):
         return JSONResponse({"authenticated": False})
-    return JSONResponse({"authenticated": True})
+    return JSONResponse({
+        "authenticated": True,
+        "can_export": bool(session.get("spotify_user_id")),
+    })
 
 
 @app.get("/api/tracks")
@@ -230,6 +246,156 @@ async def analyze_status():
         "total": _analysis_state["total"],
         "results": _analysis_state["results"],
     })
+
+
+@app.get("/api/playlists")
+async def list_playlists(request: Request):
+    session = _get_session(request)
+    if not session.get("access_token"):
+        raise HTTPException(401, "Not authenticated")
+    playlists = load_playlists()
+    summaries = [
+        {
+            "id":               p["id"],
+            "name":             p["name"],
+            "created_at":       p["created_at"],
+            "track_count":      p["track_count"],
+            "total_duration_ms":p["total_duration_ms"],
+            "warnings":         p.get("warnings", []),
+            "spotify_playlist_url": p.get("spotify_playlist_url"),
+        }
+        for p in playlists.values()
+    ]
+    summaries.sort(key=lambda x: x["created_at"], reverse=True)
+    return JSONResponse(summaries)
+
+
+@app.post("/api/playlists/generate")
+async def api_generate_playlist(request: Request):
+    session = _get_session(request)
+    access_token = session.get("access_token")
+    if not access_token:
+        raise HTTPException(401, "Not authenticated")
+
+    library = _track_cache.get(access_token, [])
+    if not library:
+        raise HTTPException(400, "Load tracks first via /api/tracks")
+
+    body = await request.json()
+    duration_min    = int(body.get("duration_min", 60))
+    energy_profile  = body.get("energy_profile", "peak_time")
+    genre_filter    = body.get("genre_filter") or None
+    hit_ratio       = float(body.get("hit_ratio", 0.25))
+    bpm_range       = body.get("bpm_range")    # [min, max] or null
+    name            = body.get("name") or None
+
+    if not 40 <= duration_min <= 180:
+        raise HTTPException(400, "duration_min must be between 40 and 180")
+    if energy_profile not in ("warmup", "peak_time", "afterhours"):
+        raise HTTPException(400, "energy_profile must be warmup | peak_time | afterhours")
+    if bpm_range:
+        bpm_range = tuple(bpm_range)
+
+    cache = load_cache()
+    params = {
+        "duration_min":   duration_min,
+        "energy_profile": energy_profile,
+        "genre_filter":   genre_filter,
+        "hit_ratio":      hit_ratio,
+        "bpm_range":      list(bpm_range) if bpm_range else None,
+    }
+
+    result = generate_playlist(
+        library=library,
+        cache=cache,
+        duration_min=duration_min,
+        energy_profile=energy_profile,
+        genre_filter=genre_filter,
+        hit_ratio=hit_ratio,
+        bpm_range=bpm_range,
+    )
+
+    if "error" in result:
+        raise HTTPException(400, result["error"])
+
+    playlist = create_playlist(result, params, name=name)
+    log.info("Playlist generated: %s (%d tracks)", playlist["name"], playlist["track_count"])
+    return JSONResponse(playlist)
+
+
+@app.get("/api/playlists/{pid}")
+async def get_playlist(request: Request, pid: str):
+    session = _get_session(request)
+    if not session.get("access_token"):
+        raise HTTPException(401, "Not authenticated")
+    playlists = load_playlists()
+    if pid not in playlists:
+        raise HTTPException(404, "Playlist not found")
+    return JSONResponse(playlists[pid])
+
+
+@app.delete("/api/playlists/{pid}")
+async def api_delete_playlist(request: Request, pid: str):
+    session = _get_session(request)
+    if not session.get("access_token"):
+        raise HTTPException(401, "Not authenticated")
+    if not delete_playlist(pid):
+        raise HTTPException(404, "Playlist not found")
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/playlists/{pid}/export")
+async def export_playlist(request: Request, pid: str):
+    session = _get_session(request)
+    access_token = session.get("access_token")
+    user_id = session.get("spotify_user_id")
+    if not access_token:
+        raise HTTPException(401, "Not authenticated")
+    if not user_id:
+        raise HTTPException(403, "Re-login required for playlist export (missing Spotify user ID)")
+
+    playlists = load_playlists()
+    if pid not in playlists:
+        raise HTTPException(404, "Playlist not found")
+    playlist = playlists[pid]
+
+    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
+    async with httpx.AsyncClient(timeout=30) as client:
+        # 1. Create empty Spotify playlist
+        create_resp = await client.post(
+            f"https://api.spotify.com/v1/users/{user_id}/playlists",
+            headers=headers,
+            json={
+                "name":        playlist["name"],
+                "description": f"Generated by Spoto DJ — {playlist['track_count']} tracks",
+                "public":      False,
+            },
+        )
+        if create_resp.status_code not in (200, 201):
+            raise HTTPException(502, f"Spotify create playlist failed: {create_resp.status_code}")
+        spotify_pid = create_resp.json()["id"]
+        spotify_url = create_resp.json()["external_urls"]["spotify"]
+
+        # 2. Add tracks in batches of 100
+        uris = [f"spotify:track:{t['spotify_id']}" for t in playlist["tracks"]]
+        for i in range(0, len(uris), 100):
+            batch = uris[i:i + 100]
+            add_resp = await client.post(
+                f"https://api.spotify.com/v1/playlists/{spotify_pid}/tracks",
+                headers=headers,
+                json={"uris": batch},
+            )
+            if add_resp.status_code not in (200, 201):
+                log.warning("Add tracks batch failed: %d", add_resp.status_code)
+
+    # 3. Persist Spotify IDs
+    playlist["spotify_playlist_id"]  = spotify_pid
+    playlist["spotify_playlist_url"] = spotify_url
+    playlists[pid] = playlist
+    save_playlists(playlists)
+
+    log.info("Exported playlist %s → %s", pid, spotify_url)
+    return JSONResponse({"spotify_playlist_url": spotify_url, "spotify_playlist_id": spotify_pid})
 
 
 @app.get("/logout")

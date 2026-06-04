@@ -29,6 +29,13 @@
       <p id="loading-msg">Fetching your library…</p>
     </section>
 
+    <!-- Tab bar (shown when authenticated) -->
+    <div id="tab-bar" style="display:none">
+      <button class="tab-btn active" data-tab="library" onclick="switchTab('library')">🎵 Library</button>
+      <button class="tab-btn" data-tab="playlists" onclick="switchTab('playlists')">🎛 DJ Sets</button>
+    </div>
+
+    <!-- ── Library tab ─────────────────────────────────────────── -->
     <section id="library" style="display:none">
       <div id="analysis-banner" style="display:none">
         <span id="analysis-msg"></span>
@@ -78,6 +85,87 @@
           <tbody id="track-tbody"></tbody>
         </table>
       </div>
+    </section>
+
+    <!-- ── DJ Sets tab ─────────────────────────────────────────── -->
+    <section id="playlists" style="display:none">
+
+      <!-- Generator form -->
+      <div class="pl-generator">
+        <h2>Generate a DJ Set</h2>
+        <div class="pl-form">
+          <div class="pl-form-row">
+            <label>
+              Duration
+              <div class="slider-row">
+                <input type="range" id="pl-duration" min="40" max="180" step="5" value="60"
+                       oninput="document.getElementById('pl-duration-val').textContent=this.value+'min'" />
+                <span id="pl-duration-val">60min</span>
+              </div>
+            </label>
+
+            <label>
+              Style
+              <div class="btn-group" id="pl-profile-group">
+                <button class="toggle-btn" data-val="warmup" onclick="selectProfile(this)">🌅 Warm-Up</button>
+                <button class="toggle-btn active" data-val="peak_time" onclick="selectProfile(this)">🔥 Peak Time</button>
+                <button class="toggle-btn" data-val="afterhours" onclick="selectProfile(this)">🌙 After Hours</button>
+              </div>
+            </label>
+
+            <label>
+              Genre focus
+              <select id="pl-genre">
+                <option value="">All genres</option>
+                <option value="electronic">Electronic</option>
+                <option value="hip_hop">Hip Hop</option>
+                <option value="latin">Latin</option>
+                <option value="rock">Rock</option>
+                <option value="pop">Pop</option>
+                <option value="jazz">Jazz / Soul</option>
+              </select>
+            </label>
+
+            <label>
+              Set name <small>(optional)</small>
+              <input type="text" id="pl-name" placeholder="e.g. Saturday night set" />
+            </label>
+          </div>
+
+          <button class="btn-primary" id="pl-generate-btn" onclick="generatePlaylist()">Generate Set</button>
+          <span id="pl-gen-status" class="muted" style="margin-left:12px"></span>
+        </div>
+      </div>
+
+      <!-- Saved playlists list -->
+      <div id="pl-list-wrap">
+        <h2 style="margin:24px 0 12px">Saved Sets</h2>
+        <div id="pl-list"></div>
+      </div>
+
+      <!-- Playlist detail overlay -->
+      <div id="pl-detail" style="display:none">
+        <div class="pl-detail-header">
+          <button class="btn-ghost" onclick="closePLDetail()">← Back</button>
+          <h2 id="pl-detail-name"></h2>
+          <div class="pl-detail-actions">
+            <button class="btn-primary" id="pl-export-btn" onclick="exportPlaylist()">Export to Spotify</button>
+            <span id="pl-export-status" class="muted" style="margin-left:10px"></span>
+          </div>
+        </div>
+        <div id="pl-detail-meta" class="pl-meta"></div>
+        <div id="pl-detail-warnings"></div>
+        <table class="pl-tracklist">
+          <thead>
+            <tr>
+              <th>#</th><th>Title</th><th>Artists</th>
+              <th>BPM</th><th>Key</th><th>Energy</th><th>Duration</th>
+            </tr>
+          </thead>
+          <tbody id="pl-detail-tbody"></tbody>
+        </table>
+      </div>
+
     </section>
   </main>
 
