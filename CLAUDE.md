@@ -2,6 +2,18 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Git workflow
+
+Always work on a feature branch — never commit directly to `main`.
+
+```bash
+git checkout -b feat/<short-description>   # start work
+# ... make changes, commit ...
+gh pr create                               # open PR against main
+```
+
+Branch naming: `feat/`, `fix/`, `refactor/`, `chore/` prefix followed by a kebab-case description (e.g. `feat/bpm-range-control`).
+
 ## Commands
 
 ```bash
