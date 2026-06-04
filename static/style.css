@@ -477,3 +477,41 @@ input[type="range"] {
   background: #e74c3c;
   border-radius: 2px;
 }
+
+/* ── Section arc chips (on playlist cards) ── */
+.pl-arc-row {
+  display: flex;
+  gap: 4px;
+  margin-top: 6px;
+  flex-wrap: wrap;
+}
+.pl-arc-chip {
+  font-size: 16px;
+  cursor: default;
+  opacity: 0.85;
+  transition: opacity 0.15s;
+}
+.pl-arc-chip:hover { opacity: 1; }
+
+/* ── Section divider rows in tracklist ── */
+.pl-section-row td {
+  padding: 14px 14px 6px !important;
+  border-bottom: none !important;
+}
+.pl-section-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--muted);
+  background: transparent;
+  padding: 0;
+}
+/* Thin rule above each section header (except first) */
+.pl-tracklist tbody tr.pl-section-row:not(:first-child) td {
+  border-top: 1px solid var(--border) !important;
+  padding-top: 18px !important;
+}

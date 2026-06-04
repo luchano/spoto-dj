@@ -319,22 +319,29 @@ function renderPlaylists(playlists) {
     el.innerHTML = '<p class="muted" style="padding:16px">No sets yet. Generate your first one above.</p>';
     return;
   }
-  el.innerHTML = playlists.map(p => `
+  el.innerHTML = playlists.map(p => {
+    // Mini section arc: render coloured chips per section in order
+    const arcChips = (p.sections || []).map(s =>
+      `<span class="pl-arc-chip" title="${esc(s.label)} (${s.count} tracks)">${s.emoji}</span>`
+    ).join("");
+
+    return `
     <div class="pl-card" onclick="openPLDetail('${p.id}')">
       <div class="pl-card-main">
         <div class="pl-card-name">${esc(p.name)}</div>
         <div class="pl-card-meta">
           <span>${p.track_count} tracks</span>
           <span>${fmtDuration(p.total_duration_ms)}</span>
-          ${p.spotify_playlist_url ? `<a class="pl-spotify-link" href="${p.spotify_playlist_url}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Open in Spotify</a>` : ""}
+          ${p.spotify_playlist_url ? `<a class="pl-spotify-link" href="${p.spotify_playlist_url}" target="_blank" rel="noopener" onclick="event.stopPropagation()">Open in Spotify ↗</a>` : ""}
         </div>
+        ${arcChips ? `<div class="pl-arc-row">${arcChips}</div>` : ""}
         ${p.warnings && p.warnings.length ? `<div class="pl-warning">⚠ ${esc(p.warnings[0])}</div>` : ""}
       </div>
       <div class="pl-card-actions">
         <button class="btn-ghost small" onclick="event.stopPropagation(); deletePL('${p.id}')">Delete</button>
       </div>
     </div>
-  `).join("");
+  `}).join("");
 }
 
 async function openPLDetail(pid) {
@@ -380,9 +387,26 @@ async function openPLDetail(pid) {
     exportStatus.textContent = "";
   }
 
-  // Tracklist — energy arc visualisation as a mini bar
+  // Tracklist with section dividers
   const tbody = document.getElementById("pl-detail-tbody");
-  tbody.innerHTML = p.tracks.map(t => {
+  let lastSection = null;
+  const rows = [];
+
+  p.tracks.forEach(t => {
+    // Insert section header row when section changes
+    if (t.section && t.section !== lastSection) {
+      const emoji = t.section_emoji || "";
+      const label = t.section_label || t.section;
+      rows.push(`
+        <tr class="pl-section-row">
+          <td colspan="7">
+            <span class="pl-section-badge">${emoji} ${esc(label)}</span>
+          </td>
+        </tr>
+      `);
+      lastSection = t.section;
+    }
+
     const energyBar = `<div class="pl-energy-bar" style="width:${t.energy}%"></div>`;
     const camelot = t.camelot && t.camelot !== "?"
       ? camelotBadge(t.camelot)
@@ -390,7 +414,8 @@ async function openPLDetail(pid) {
     const link = t.spotify_url
       ? `<a href="${t.spotify_url}" target="_blank" rel="noopener">${esc(t.title)}</a>`
       : esc(t.title);
-    return `<tr>
+
+    rows.push(`<tr>
       <td class="muted">${t.position}</td>
       <td>${link}</td>
       <td class="muted">${esc(t.artists)}</td>
@@ -398,8 +423,10 @@ async function openPLDetail(pid) {
       <td>${camelot}</td>
       <td class="pl-energy-cell"><div class="pl-energy-wrap">${energyBar}</div><span>${t.energy}</span></td>
       <td class="muted">${fmtTrackDuration(t.duration_ms)}</td>
-    </tr>`;
-  }).join("");
+    </tr>`);
+  });
+
+  tbody.innerHTML = rows.join("");
 }
 
 function closePLDetail() {

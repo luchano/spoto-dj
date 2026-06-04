@@ -261,7 +261,8 @@ async def list_playlists(request: Request):
             "created_at":       p["created_at"],
             "track_count":      p["track_count"],
             "total_duration_ms":p["total_duration_ms"],
-            "warnings":         p.get("warnings", []),
+            "warnings":             p.get("warnings", []),
+            "sections":             p.get("sections", []),
             "spotify_playlist_url": p.get("spotify_playlist_url"),
         }
         for p in playlists.values()

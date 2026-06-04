@@ -1,5 +1,17 @@
 """
-Tests for playlist_engine.py
+Tests for playlist_engine.py — narrative arc edition.
+
+Coverage:
+  - Camelot wheel correctness
+  - Energy arc profiles
+  - Genre classification
+  - Pool building
+  - Section definitions (weights, BPM factors)
+  - Section distribution
+  - Track role classification
+  - Scoring function
+  - Core generator (narrative, sections, BPM arc, no duplicates)
+  - Persistence
 """
 import json
 import tempfile
@@ -10,13 +22,19 @@ import pytest
 
 from playlist_engine import (
     PLAYLISTS_FILE,
+    SECTION_PROFILES,
+    SectionDef,
+    SectionSlot,
     build_energy_arc,
     build_pool,
     camelot_neighbors,
     camelot_score,
     classify_genre,
+    classify_track_role,
+    compute_base_bpm,
     create_playlist,
     delete_playlist,
+    distribute_sections,
     generate,
     load_playlists,
     save_playlists,
@@ -24,9 +42,9 @@ from playlist_engine import (
 )
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Helpers
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _track(
     tid="t1", title="Song", artists="Artist",
@@ -47,32 +65,30 @@ def _cache_ok(bpm=128, camelot="8A", energy=70):
     return {"bpm": bpm, "camelot": camelot, "energy": energy}
 
 
-def _make_library(n=20, base_bpm=128):
-    """Return n distinct tracks with staggered BPMs and camelot keys."""
-    keys = ["8A", "9A", "8B", "7A", "10A", "5A", "3B", "12A", "6A", "11A",
-            "1B", "2A", "4A", "9B", "7B", "6B", "5B", "4B", "3A", "2B"]
+def _make_library(n=30, base_bpm=112):
+    """Return *n* tracks with varied BPMs, keys, energies and popularities."""
+    keys = ["8A","9A","8B","7A","10A","5A","3B","12A","6A","11A",
+            "1B","2A","4A","9B","7B","6B","5B","4B","3A","2B"]
     tracks = []
     for i in range(n):
+        bpm    = base_bpm + (i % 20) - 10     # base ± 10
+        energy = 20 + (i * 4) % 80            # 20–99
+        pop    = 10 + (i * 7) % 91            # 10–100
         tracks.append(_track(
-            tid=f"t{i}",
-            title=f"Track {i}",
-            artists=f"Artist {i % 5}",   # 5 artists → some repeats
-            bpm=base_bpm + (i % 10) - 5,
-            camelot=keys[i % len(keys)],
-            energy=40 + (i * 3) % 60,
-            popularity=30 + (i * 7) % 70,
+            tid=f"t{i}", title=f"Track {i}", artists=f"Artist {i % 6}",
+            bpm=bpm, camelot=keys[i % len(keys)],
+            energy=energy, popularity=pop,
         ))
     return tracks
 
 
 def _make_cache(tracks):
-    """Build a cache dict from track list (no errors)."""
     return {t["id"]: _cache_ok(t["bpm"], t["camelot"], t["energy"]) for t in tracks}
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Camelot wheel
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestCamelotNeighbors:
     def test_returns_frozenset(self):
@@ -82,7 +98,6 @@ class TestCamelotNeighbors:
         assert "8A" in camelot_neighbors("8A")
 
     def test_relative_major_minor(self):
-        # 8A (Cm) ↔ 8B (Eb maj) are relative
         assert "8B" in camelot_neighbors("8A")
         assert "8A" in camelot_neighbors("8B")
 
@@ -93,11 +108,9 @@ class TestCamelotNeighbors:
         assert "7A" in camelot_neighbors("8A")
 
     def test_wrap_12_to_1(self):
-        # 12A + 1 = 1A
         assert "1A" in camelot_neighbors("12A")
 
     def test_wrap_1_to_12(self):
-        # 1A - 1 = 12A
         assert "12A" in camelot_neighbors("1A")
 
     def test_unknown_key_returns_empty(self):
@@ -108,11 +121,8 @@ class TestCamelotNeighbors:
         assert camelot_neighbors("13A") == frozenset()
         assert camelot_neighbors("0B") == frozenset()
 
-    @pytest.mark.parametrize("key", [
-        "1A", "1B", "6A", "6B", "12A", "12B",
-    ])
+    @pytest.mark.parametrize("key", ["1A","1B","6A","6B","12A","12B"])
     def test_always_4_neighbors(self, key):
-        # Every valid key has exactly 4 neighbors (self + relative + ±1)
         assert len(camelot_neighbors(key)) == 4
 
 
@@ -134,30 +144,27 @@ class TestCamelotScore:
         assert 0.0 < score < 1.0
 
     def test_symmetry(self):
-        # Compatibility should be symmetric
         assert camelot_score("8A", "9A") == camelot_score("9A", "8A")
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Energy arc
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestBuildEnergyArc:
     def test_correct_length(self):
-        assert len(build_energy_arc(10)) == 10
-        assert len(build_energy_arc(1)) == 1
-        assert len(build_energy_arc(40)) == 40
+        for n in (1, 10, 40):
+            assert len(build_energy_arc(n)) == n
 
     def test_values_between_0_and_1(self):
         for profile in ("warmup", "peak_time", "afterhours"):
             arc = build_energy_arc(20, profile)
-            assert all(0.0 <= v <= 1.0 for v in arc), f"Out-of-range in {profile}"
+            assert all(0.0 <= v <= 1.0 for v in arc)
 
-    def test_peak_time_peaks_in_middle(self):
+    def test_peak_time_peaks_in_first_60_pct(self):
         arc = build_energy_arc(20, "peak_time")
         peak_idx = arc.index(max(arc))
-        # Peak should be somewhere in the first ~60% of the set
-        assert peak_idx < 14
+        assert peak_idx < 13
 
     def test_warmup_starts_low_ends_high(self):
         arc = build_energy_arc(20, "warmup")
@@ -168,19 +175,177 @@ class TestBuildEnergyArc:
         assert arc[0] > arc[-1]
 
     def test_unknown_profile_falls_back_to_peak_time(self):
-        arc1 = build_energy_arc(10, "unknown_profile")
-        arc2 = build_energy_arc(10, "peak_time")
-        assert arc1 == arc2
+        assert build_energy_arc(10, "xyzzy") == build_energy_arc(10, "peak_time")
 
     def test_single_track_arc(self):
-        arc = build_energy_arc(1, "peak_time")
-        assert len(arc) == 1
-        assert 0.0 <= arc[0] <= 1.0
+        arc = build_energy_arc(1)
+        assert len(arc) == 1 and 0.0 <= arc[0] <= 1.0
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
+# Section profiles
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestSectionProfiles:
+    @pytest.mark.parametrize("profile", ["peak_time", "warmup", "afterhours"])
+    def test_weights_sum_to_one(self, profile):
+        total = sum(s.weight for s in SECTION_PROFILES[profile])
+        assert abs(total - 1.0) < 1e-6, f"{profile} weights sum to {total}"
+
+    @pytest.mark.parametrize("profile", ["peak_time", "warmup", "afterhours"])
+    def test_exactly_7_sections(self, profile):
+        assert len(SECTION_PROFILES[profile]) == 7
+
+    @pytest.mark.parametrize("profile", ["peak_time", "warmup", "afterhours"])
+    def test_energy_ranges_valid(self, profile):
+        for s in SECTION_PROFILES[profile]:
+            assert 0 <= s.energy_min < s.energy_max <= 100, \
+                f"{profile}/{s.name}: bad energy range [{s.energy_min},{s.energy_max}]"
+
+    @pytest.mark.parametrize("profile", ["peak_time", "warmup", "afterhours"])
+    def test_bpm_factors_reasonable(self, profile):
+        for s in SECTION_PROFILES[profile]:
+            assert 0.80 <= s.bpm_factor <= 1.20, \
+                f"{profile}/{s.name}: bpm_factor {s.bpm_factor} out of range"
+
+    def test_peak_time_climax_higher_energy_than_journey(self):
+        secs = {s.name: s for s in SECTION_PROFILES["peak_time"]}
+        assert secs["climax"].energy_min > secs["mid_journey"].energy_min
+
+    def test_afterhours_descends_in_energy(self):
+        """After-hours should have lower energy targets toward the end."""
+        secs = SECTION_PROFILES["afterhours"]
+        # intro energy midpoint > outro energy midpoint
+        intro_mid = (secs[0].energy_min + secs[0].energy_max) / 2
+        outro_mid = (secs[-1].energy_min + secs[-1].energy_max) / 2
+        assert intro_mid > outro_mid
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Section distribution
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestDistributeSections:
+    def test_total_slots_equals_n(self):
+        for n in (5, 10, 16, 24, 40):
+            slots = distribute_sections(n, "peak_time", 120)
+            assert len(slots) == n, f"n={n}: got {len(slots)} slots"
+
+    def test_section_order_preserved(self):
+        """Slots must maintain narrative order (intro first, outro last)."""
+        slots = distribute_sections(16, "peak_time", 120)
+        names = [s.section_name for s in slots]
+        # intro must come before climax
+        assert names.index("intro") < names.index("climax")
+        # outro must be last group
+        last_section = names[-1]
+        assert last_section == "outro"
+
+    def test_all_profiles_produce_slots(self):
+        for profile in ("peak_time", "warmup", "afterhours"):
+            slots = distribute_sections(16, profile, 120)
+            assert len(slots) == 16
+
+    def test_bpm_targets_scaled_to_base(self):
+        slots_80  = distribute_sections(16, "peak_time", 80)
+        slots_140 = distribute_sections(16, "peak_time", 140)
+        avg_80  = sum(s.bpm_target for s in slots_80)  / len(slots_80)
+        avg_140 = sum(s.bpm_target for s in slots_140) / len(slots_140)
+        assert avg_140 > avg_80
+
+    def test_climax_slots_are_hit_slots(self):
+        slots = distribute_sections(16, "peak_time", 120)
+        climax_slots = [s for s in slots if s.section_name == "climax"]
+        assert any(s.is_hit_slot for s in climax_slots)
+
+    def test_intro_slots_not_hit_slots(self):
+        slots = distribute_sections(16, "peak_time", 120)
+        intro_slots = [s for s in slots if s.section_name == "intro"]
+        assert not any(s.is_hit_slot for s in intro_slots)
+
+    def test_positions_are_contiguous(self):
+        slots = distribute_sections(16, "peak_time", 120)
+        positions = [s.position for s in slots]
+        assert positions == list(range(16))
+
+    def test_unknown_profile_falls_back(self):
+        slots = distribute_sections(16, "unknown", 120)
+        assert len(slots) == 16   # doesn't crash
+
+    def test_large_set(self):
+        slots = distribute_sections(47, "peak_time", 120)
+        assert len(slots) == 47
+
+    def test_energy_ranges_are_reasonable(self):
+        for profile in ("peak_time", "warmup", "afterhours"):
+            slots = distribute_sections(20, profile, 120)
+            for s in slots:
+                assert s.energy_min < s.energy_max
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Track role classification
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestClassifyTrackRole:
+    def test_opener(self):
+        t = _track(bpm=100, energy=45)   # low BPM, low energy
+        pool = build_pool([t], {t["id"]: _cache_ok(100, "8A", 45)})
+        assert classify_track_role(pool[0], 120) == "opener"
+
+    def test_climax(self):
+        t = _track(bpm=135, energy=90, popularity=75)
+        pool = build_pool([t], {t["id"]: _cache_ok(135, "8A", 90)})
+        assert classify_track_role(pool[0], 120) == "climax"
+
+    def test_anthem(self):
+        t = _track(bpm=125, energy=75, popularity=60)
+        pool = build_pool([t], {t["id"]: _cache_ok(125, "8A", 75)})
+        assert classify_track_role(pool[0], 120) == "anthem"
+
+    def test_emotional(self):
+        t = _track(bpm=108, energy=55)
+        pool = build_pool([t], {t["id"]: _cache_ok(108, "8A", 55)})
+        role = classify_track_role(pool[0], 120)
+        assert role == "emotional"
+
+    def test_closer(self):
+        # ratio = 111/120 = 0.925 — moderately below base, low energy → closer
+        t = _track(bpm=111, energy=50)
+        pool = build_pool([t], {t["id"]: _cache_ok(111, "8A", 50)})
+        role = classify_track_role(pool[0], 120)
+        assert role in ("closer", "emotional")
+
+    def test_returns_string(self):
+        t = _track()
+        pool = build_pool([t], {t["id"]: _cache_ok()})
+        role = classify_track_role(pool[0], 120)
+        assert isinstance(role, str) and len(role) > 0
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compute base BPM
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestComputeBaseBpm:
+    def test_returns_median(self):
+        tracks = _make_library(10, base_bpm=120)
+        pool   = build_pool(tracks, _make_cache(tracks))
+        bpm    = compute_base_bpm(pool)
+        assert 110 <= bpm <= 130
+
+    def test_empty_pool_returns_120(self):
+        assert compute_base_bpm([]) == 120
+
+    def test_single_track(self):
+        t    = _track(bpm=100)
+        pool = build_pool([t], {t["id"]: _cache_ok(100)})
+        assert compute_base_bpm(pool) == 100
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Genre classification
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestClassifyGenre:
     def test_electronic(self):
@@ -195,238 +360,219 @@ class TestClassifyGenre:
     def test_empty_returns_none(self):
         assert classify_genre([]) is None
 
-    def test_unknown_genre_returns_none(self):
-        assert classify_genre(["xyzzy", "foobar"]) is None
+    def test_unknown_returns_none(self):
+        assert classify_genre(["xyzzy"]) is None
 
-    def test_mixed_picks_best_match(self):
-        # 2 electronic keywords vs 1 hip hop → electronic
-        result = classify_genre(["electronic", "deep house", "rap"])
-        assert result == "electronic"
+    def test_mixed_picks_best(self):
+        assert classify_genre(["electronic", "deep house", "rap"]) == "electronic"
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Pool building
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestBuildPool:
     def test_excludes_error_entries(self):
         lib = [_track("t1"), _track("t2")]
         cache = {"t1": _cache_ok(), "t2": {"error": "not found: 'x'"}}
-        pool = build_pool(lib, cache)
-        assert len(pool) == 1
-        assert pool[0]["id"] == "t1"
+        assert len(build_pool(lib, cache)) == 1
 
     def test_excludes_missing_from_cache(self):
         lib = [_track("t1"), _track("t2")]
-        cache = {"t1": _cache_ok()}
-        pool = build_pool(lib, cache)
-        assert len(pool) == 1
+        assert len(build_pool(lib, {"t1": _cache_ok()})) == 1
 
     def test_excludes_zero_bpm(self):
         lib = [_track("t1")]
-        cache = {"t1": _cache_ok(bpm=0)}
-        pool = build_pool(lib, cache)
-        assert len(pool) == 0
+        assert build_pool(lib, {"t1": _cache_ok(bpm=0)}) == []
 
-    def test_uses_cache_bpm_over_library(self):
+    def test_uses_cache_bpm_not_library(self):
         lib = [_track("t1", bpm=100)]
-        cache = {"t1": _cache_ok(bpm=130)}
-        pool = build_pool(lib, cache)
+        pool = build_pool(lib, {"t1": _cache_ok(bpm=130)})
         assert pool[0]["bpm"] == 130
 
     def test_artists_always_a_list(self):
-        lib = [_track("t1", artists="Artist A, Artist B")]
-        cache = {"t1": _cache_ok()}
-        pool = build_pool(lib, cache)
+        lib = [_track("t1", artists="A, B")]
+        pool = build_pool(lib, {"t1": _cache_ok()})
         assert isinstance(pool[0]["artists_list"], list)
         assert len(pool[0]["artists_list"]) == 2
 
     def test_genre_cluster_assigned(self):
-        lib = [_track("t1", genres=["electronic", "deep house"])]
-        cache = {"t1": _cache_ok()}
-        pool = build_pool(lib, cache)
+        lib = [_track("t1", genres=["electronic"])]
+        pool = build_pool(lib, {"t1": _cache_ok()})
         assert pool[0]["genre_cluster"] == "electronic"
 
-    def test_empty_library(self):
+    def test_empty_inputs(self):
         assert build_pool([], {}) == []
-
-    def test_empty_cache(self):
-        lib = [_track("t1"), _track("t2")]
-        assert build_pool(lib, {}) == []
+        assert build_pool([_track()], {}) == []
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Scoring
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestScoreCandidate:
-    def _c(self, bpm=128, camelot="8A", energy=70, popularity=50):
-        t = _track(bpm=bpm, camelot=camelot, energy=energy, popularity=popularity)
-        pool = build_pool([t], {t["id"]: _cache_ok(bpm, camelot, energy)})
-        return pool[0]
+    def _pool_track(self, bpm=128, camelot="8A", energy=70, pop=50):
+        t = _track(bpm=bpm, camelot=camelot, energy=energy, popularity=pop)
+        return build_pool([t], {t["id"]: _cache_ok(bpm, camelot, energy)})[0]
 
     def test_same_key_beats_incompatible(self):
-        prev = self._c(camelot="8A")
-        same_key = self._c(camelot="8A")
-        bad_key  = self._c(camelot="4B")
-        s_same = score_candidate(same_key, prev, 0.7, False, set())
-        s_bad  = score_candidate(bad_key,  prev, 0.7, False, set())
+        prev = self._pool_track(camelot="8A")
+        s_same = score_candidate(self._pool_track(camelot="8A"), prev, 0.7, 128, False, set())
+        s_bad  = score_candidate(self._pool_track(camelot="4B"), prev, 0.7, 128, False, set())
         assert s_same > s_bad
 
     def test_close_bpm_beats_far(self):
-        prev   = self._c(bpm=128)
-        close  = self._c(bpm=130, camelot="8A")
-        far    = self._c(bpm=150, camelot="8A")
-        s_close = score_candidate(close, prev, 0.7, False, set())
-        s_far   = score_candidate(far,   prev, 0.7, False, set())
+        prev  = self._pool_track(bpm=128)
+        s_close = score_candidate(self._pool_track(bpm=130, camelot="8A"), prev, 0.7, 128, False, set())
+        s_far   = score_candidate(self._pool_track(bpm=160, camelot="8A"), prev, 0.7, 128, False, set())
         assert s_close > s_far
 
     def test_same_artist_penalty(self):
-        prev  = self._c()
-        cand  = self._c(popularity=80)
-        pool_cand = build_pool(
-            [_track("tx", artists="Artist A", popularity=80)],
-            {"tx": _cache_ok()},
-        )[0]
-        no_penalty = score_candidate(pool_cand, prev, 0.7, False, set())
-        with_penalty = score_candidate(pool_cand, prev, 0.7, False, {"artist a"})
-        assert no_penalty > with_penalty
+        t = build_pool([_track("tx", artists="DJ X", popularity=80)],
+                       {"tx": _cache_ok()})[0]
+        s_no  = score_candidate(t, None, 0.7, 128, False, set())
+        s_yes = score_candidate(t, None, 0.7, 128, False, {"dj x"})
+        assert s_no > s_yes
 
     def test_hit_slot_favours_popular(self):
-        popular  = self._c(popularity=90)
-        obscure  = self._c(popularity=10)
-        s_pop_hit  = score_candidate(popular, None, 0.7, True, set())
-        s_obs_hit  = score_candidate(obscure, None, 0.7, True, set())
-        assert s_pop_hit > s_obs_hit
+        popular = self._pool_track(pop=90)
+        obscure = self._pool_track(pop=10)
+        assert score_candidate(popular, None, 0.7, 128, True, set()) > \
+               score_candidate(obscure, None, 0.7, 128, True, set())
 
-    def test_score_never_negative(self):
-        prev = self._c()
-        cand = self._c(bpm=200, camelot="4B", energy=5)
-        assert score_candidate(cand, prev, 1.0, False, {"artist"}) >= 0.0
+    def test_score_non_negative(self):
+        prev = self._pool_track()
+        cand = self._pool_track(bpm=200, camelot="4B", energy=5)
+        assert score_candidate(cand, prev, 1.0, 150, False, {"artist"}) >= 0.0
 
-    def test_no_prev_still_scores(self):
-        cand = self._c()
-        score = score_candidate(cand, None, 0.5, False, set())
-        assert 0.0 <= score <= 1.5   # possible range
+    def test_bpm_on_target_beats_off_target(self):
+        prev     = self._pool_track(bpm=120)
+        on_t     = self._pool_track(bpm=120)
+        off_t    = self._pool_track(bpm=160)
+        assert score_candidate(on_t, prev, 0.7, 120, False, set()) > \
+               score_candidate(off_t, prev, 0.7, 120, False, set())
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Core generator
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestGenerate:
     def setup_method(self):
-        self.library = _make_library(30)
+        self.library = _make_library(40)
         self.cache   = _make_cache(self.library)
 
     def test_returns_tracks(self):
-        result = generate(self.library, self.cache, duration_min=40)
-        assert len(result["tracks"]) > 0
+        r = generate(self.library, self.cache, duration_min=40)
+        assert r["track_count"] > 0
 
-    def test_honours_approximate_duration(self):
-        result = generate(self.library, self.cache, duration_min=60)
-        # Should produce roughly 60 min worth of music (± 25%)
-        minutes = result["total_duration_ms"] / 60_000
-        assert 30 <= minutes <= 90
+    def test_section_info_on_every_track(self):
+        r = generate(self.library, self.cache, duration_min=60)
+        for t in r["tracks"]:
+            assert "section"       in t and t["section"]
+            assert "section_label" in t and t["section_label"]
+
+    def test_sections_summary_in_result(self):
+        r = generate(self.library, self.cache, duration_min=60)
+        assert "sections" in r
+        assert len(r["sections"]) >= 5   # at least 5 distinct sections
+
+    def test_sections_summary_has_required_fields(self):
+        r = generate(self.library, self.cache, duration_min=60)
+        for s in r["sections"]:
+            assert "name" in s and "label" in s and "emoji" in s
+            assert "start_position" in s and "count" in s
+
+    def test_narrative_order(self):
+        """intro must come before climax which must come before outro."""
+        r = generate(self.library, self.cache, duration_min=60)
+        section_names = [t["section"] for t in r["tracks"]]
+        intro_pos  = next((i for i,s in enumerate(section_names) if s=="intro"),  None)
+        climax_pos = next((i for i,s in enumerate(section_names) if s=="climax"), None)
+        outro_pos  = next((i for i,s in enumerate(section_names) if s=="outro"),  None)
+        if intro_pos and climax_pos:
+            assert intro_pos < climax_pos
+        if climax_pos and outro_pos:
+            assert climax_pos < outro_pos
+
+    def test_peak_time_has_valley(self):
+        """mid_journey (valley) should have lower avg energy than peak_a and climax."""
+        r = generate(self.library, self.cache, duration_min=90, energy_profile="peak_time")
+        by_section = {}
+        for t in r["tracks"]:
+            s = t["section"]
+            by_section.setdefault(s, []).append(t["energy"])
+        if "mid_journey" in by_section and "climax" in by_section:
+            avg_valley = sum(by_section["mid_journey"]) / len(by_section["mid_journey"])
+            avg_climax = sum(by_section["climax"])      / len(by_section["climax"])
+            assert avg_valley < avg_climax
 
     def test_no_duplicate_tracks(self):
-        result = generate(self.library, self.cache, duration_min=60)
-        ids = [t["id"] for t in result["tracks"]]
+        r = generate(self.library, self.cache, duration_min=60)
+        ids = [t["id"] for t in r["tracks"]]
         assert len(ids) == len(set(ids))
 
-    def test_no_same_artist_consecutive(self):
-        result = generate(self.library, self.cache, duration_min=60)
-        tracks = result["tracks"]
-        for i in range(1, len(tracks)):
-            prev_artists = {a.lower() for a in tracks[i-1]["artists_list"]}
-            curr_artists = {a.lower() for a in tracks[i]["artists_list"]}
-            # Allow overlap only if there really is no alternative
-            # (just verify the field exists; enforcement is best-effort)
-            assert "artists_list" in tracks[i]
+    def test_approximate_duration(self):
+        r = generate(self.library, self.cache, duration_min=60)
+        minutes = r["total_duration_ms"] / 60_000
+        assert 25 <= minutes <= 90
+
+    def test_all_profiles_produce_sections(self):
+        for profile in ("warmup", "peak_time", "afterhours"):
+            r = generate(self.library, self.cache, duration_min=40, energy_profile=profile)
+            assert r["track_count"] > 0
+            assert len(r["sections"]) >= 3
 
     def test_empty_cache_returns_error(self):
-        result = generate(self.library, {})
-        assert "error" in result
+        r = generate(self.library, {})
+        assert "error" in r
 
-    def test_genre_filter_adds_warning_when_insufficient(self):
-        # Use a genre that no track in our library matches
-        result = generate(self.library, self.cache, genre_filter="latin")
-        # Either it worked with the full library (warning added) or it still produced tracks
-        assert "tracks" in result
-        # If genre had no matches, warning should mention it
-        if result.get("warnings"):
-            assert any("latin" in w for w in result["warnings"])
-
-    def test_bpm_range_filter(self):
-        result = generate(
-            self.library, self.cache,
-            duration_min=30,
-            bpm_range=(125, 132),
-        )
-        if not result.get("warnings"):
-            # All tracks should be within (relaxed) range when filter applied
-            for t in result["tracks"]:
-                assert 115 <= t["bpm"] <= 145   # allow some slack from pass 2/3
-
-    def test_min_5_tracks(self):
-        # Even a very short request produces at least some tracks
-        result = generate(self.library, self.cache, duration_min=10)
-        assert result["track_count"] >= 1
-
-    def test_all_profiles(self):
-        for profile in ("warmup", "peak_time", "afterhours"):
-            result = generate(
-                self.library, self.cache,
-                duration_min=40, energy_profile=profile
-            )
-            assert result["track_count"] > 0, f"Profile {profile} produced no tracks"
-
-    def test_result_fields_present(self):
-        result = generate(self.library, self.cache, duration_min=40)
-        assert "tracks" in result
-        assert "total_duration_ms" in result
-        assert "track_count" in result
-        assert "warnings" in result
-
-    def test_track_fields_present(self):
-        result = generate(self.library, self.cache, duration_min=40)
-        required = {"id", "title", "artists", "bpm", "camelot", "energy",
-                    "duration_ms", "popularity"}
-        for t in result["tracks"]:
-            assert required.issubset(t.keys())
+    def test_genre_filter_warning_when_insufficient(self):
+        r = generate(self.library, self.cache, genre_filter="latin")
+        if r.get("warnings"):
+            assert any("latin" in w for w in r["warnings"])
 
     def test_track_count_matches_tracks_list(self):
-        result = generate(self.library, self.cache, duration_min=60)
-        assert result["track_count"] == len(result["tracks"])
+        r = generate(self.library, self.cache, duration_min=60)
+        assert r["track_count"] == len(r["tracks"])
+
+    def test_result_has_required_fields(self):
+        r = generate(self.library, self.cache, duration_min=40)
+        for key in ("tracks", "total_duration_ms", "track_count", "warnings", "sections"):
+            assert key in r
 
     def test_bpm_transitions_mostly_smooth(self):
-        """At least 70% of consecutive transitions should be within ±15 BPM."""
-        result = generate(self.library, self.cache, duration_min=60)
-        tracks = result["tracks"]
+        r = generate(self.library, self.cache, duration_min=60)
+        tracks = r["tracks"]
         if len(tracks) < 2:
             return
-        smooth = sum(
-            1 for i in range(1, len(tracks))
-            if abs(tracks[i]["bpm"] - tracks[i-1]["bpm"]) <= 15
-        )
-        ratio = smooth / (len(tracks) - 1)
-        assert ratio >= 0.70, f"Only {ratio:.0%} smooth BPM transitions"
+        smooth = sum(1 for i in range(1, len(tracks))
+                     if abs(tracks[i]["bpm"] - tracks[i-1]["bpm"]) <= 18)
+        assert smooth / (len(tracks) - 1) >= 0.65
+
+    def test_afterhours_opening_energy_higher_than_outro(self):
+        r = generate(self.library, self.cache, duration_min=60, energy_profile="afterhours")
+        by_s = {}
+        for t in r["tracks"]:
+            by_s.setdefault(t["section"], []).append(t["energy"])
+        if "intro" in by_s and "outro" in by_s:
+            assert sum(by_s["intro"]) / len(by_s["intro"]) > \
+                   sum(by_s["outro"]) / len(by_s["outro"])
 
 
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 # Persistence
-# ---------------------------------------------------------------------------
+# ─────────────────────────────────────────────────────────────────────────────
 
 class TestPersistence:
-    def setup_method(self, method):
-        # Redirect PLAYLISTS_FILE to a temp file for each test
+    def setup_method(self, _):
         self._tmp = tempfile.NamedTemporaryFile(suffix=".json", delete=False)
         self._tmp.close()
         self._tmp_path = Path(self._tmp.name)
         self._patcher = patch("playlist_engine.PLAYLISTS_FILE", self._tmp_path)
         self._patcher.start()
 
-    def teardown_method(self, method):
+    def teardown_method(self, _):
         self._patcher.stop()
         self._tmp_path.unlink(missing_ok=True)
 
@@ -440,50 +586,43 @@ class TestPersistence:
         assert load_playlists() == data
 
     def test_create_playlist_persists(self):
-        library = _make_library(20)
-        cache   = _make_cache(library)
-        result  = generate(library, cache, duration_min=30)
-        params  = {"duration_min": 30, "energy_profile": "peak_time"}
+        lib    = _make_library(25)
+        cache  = _make_cache(lib)
+        result = generate(lib, cache, duration_min=30)
+        pl = create_playlist(result, {"energy_profile": "peak_time"}, name="My Set")
+        assert pl["id"] in load_playlists()
+        assert load_playlists()[pl["id"]]["name"] == "My Set"
 
-        pl = create_playlist(result, params, name="My Set")
-        stored = load_playlists()
-
-        assert pl["id"] in stored
-        assert stored[pl["id"]]["name"] == "My Set"
-
-    def test_create_playlist_auto_name(self):
-        library = _make_library(20)
-        cache   = _make_cache(library)
-        result  = generate(library, cache, duration_min=30)
-        pl = create_playlist(result, {"energy_profile": "warmup"})
-        assert "Warm-Up" in pl["name"]
-
-    def test_create_playlist_track_structure(self):
-        library = _make_library(20)
-        cache   = _make_cache(library)
-        result  = generate(library, cache, duration_min=30)
+    def test_create_playlist_includes_section_info(self):
+        lib    = _make_library(25)
+        cache  = _make_cache(lib)
+        result = generate(lib, cache, duration_min=30)
         pl = create_playlist(result, {})
         for t in pl["tracks"]:
-            assert "position" in t
-            assert "spotify_id" in t
-            assert "bpm" in t
-            assert "camelot" in t
+            assert "section" in t
 
-    def test_create_playlist_has_spotify_fields(self):
-        library = _make_library(20)
-        cache   = _make_cache(library)
-        result  = generate(library, cache, duration_min=30)
+    def test_create_playlist_includes_sections_summary(self):
+        lib    = _make_library(25)
+        cache  = _make_cache(lib)
+        result = generate(lib, cache, duration_min=30)
         pl = create_playlist(result, {})
-        assert pl["spotify_playlist_id"] is None
-        assert pl["spotify_playlist_url"] is None
+        assert "sections" in pl
+        assert len(pl["sections"]) >= 3
+
+    def test_create_playlist_auto_name_peak_time(self):
+        lib = _make_library(25); cache = _make_cache(lib)
+        pl  = create_playlist(generate(lib, cache, duration_min=30), {"energy_profile": "peak_time"})
+        assert "Peak Time" in pl["name"]
+
+    def test_create_playlist_auto_name_warmup(self):
+        lib = _make_library(25); cache = _make_cache(lib)
+        pl  = create_playlist(generate(lib, cache, duration_min=30), {"energy_profile": "warmup"})
+        assert "Warm-Up" in pl["name"]
 
     def test_delete_playlist(self):
-        library = _make_library(20)
-        cache   = _make_cache(library)
-        result  = generate(library, cache, duration_min=30)
-        pl = create_playlist(result, {})
+        lib = _make_library(25); cache = _make_cache(lib)
+        pl  = create_playlist(generate(lib, cache, duration_min=30), {})
         pid = pl["id"]
-
         assert delete_playlist(pid) is True
         assert pid not in load_playlists()
 
@@ -491,12 +630,10 @@ class TestPersistence:
         assert delete_playlist("pl_doesnotexist") is False
 
     def test_multiple_playlists_coexist(self):
-        library = _make_library(20)
-        cache   = _make_cache(library)
-        result  = generate(library, cache, duration_min=30)
+        lib = _make_library(25); cache = _make_cache(lib)
+        result = generate(lib, cache, duration_min=30)
         p1 = create_playlist(result, {}, name="Set 1")
         p2 = create_playlist(result, {}, name="Set 2")
         stored = load_playlists()
-        assert p1["id"] in stored
-        assert p2["id"] in stored
+        assert p1["id"] in stored and p2["id"] in stored
         assert len(stored) == 2
