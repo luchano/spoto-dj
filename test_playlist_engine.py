@@ -22,7 +22,7 @@ import pytest
 
 from playlist_engine import (
     PLAYLISTS_FILE,
-    SECTION_PROFILES,
+    UNIVERSAL_SECTIONS,
     SectionDef,
     SectionSlot,
     build_energy_arc,
@@ -183,42 +183,47 @@ class TestBuildEnergyArc:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Section profiles
+# Universal sections
 # ─────────────────────────────────────────────────────────────────────────────
 
-class TestSectionProfiles:
-    @pytest.mark.parametrize("profile", ["peak_time", "warmup", "afterhours"])
-    def test_weights_sum_to_one(self, profile):
-        total = sum(s.weight for s in SECTION_PROFILES[profile])
-        assert abs(total - 1.0) < 1e-6, f"{profile} weights sum to {total}"
+class TestUniversalSections:
+    def test_weights_sum_to_one(self):
+        total = sum(s.weight for s in UNIVERSAL_SECTIONS)
+        assert abs(total - 1.0) < 1e-6, f"weights sum to {total}"
 
-    @pytest.mark.parametrize("profile", ["peak_time", "warmup", "afterhours"])
-    def test_exactly_7_sections(self, profile):
-        assert len(SECTION_PROFILES[profile]) == 7
+    def test_exactly_7_sections(self):
+        assert len(UNIVERSAL_SECTIONS) == 7
 
-    @pytest.mark.parametrize("profile", ["peak_time", "warmup", "afterhours"])
-    def test_energy_ranges_valid(self, profile):
-        for s in SECTION_PROFILES[profile]:
+    def test_energy_ranges_valid(self):
+        for s in UNIVERSAL_SECTIONS:
             assert 0 <= s.energy_min < s.energy_max <= 100, \
-                f"{profile}/{s.name}: bad energy range [{s.energy_min},{s.energy_max}]"
+                f"{s.name}: bad energy range [{s.energy_min},{s.energy_max}]"
 
-    @pytest.mark.parametrize("profile", ["peak_time", "warmup", "afterhours"])
-    def test_bpm_factors_reasonable(self, profile):
-        for s in SECTION_PROFILES[profile]:
+    def test_bpm_factors_reasonable(self):
+        for s in UNIVERSAL_SECTIONS:
             assert 0.80 <= s.bpm_factor <= 1.20, \
-                f"{profile}/{s.name}: bpm_factor {s.bpm_factor} out of range"
+                f"{s.name}: bpm_factor {s.bpm_factor} out of range"
 
-    def test_peak_time_climax_higher_energy_than_journey(self):
-        secs = {s.name: s for s in SECTION_PROFILES["peak_time"]}
+    def test_climax_higher_energy_than_journey(self):
+        secs = {s.name: s for s in UNIVERSAL_SECTIONS}
         assert secs["climax"].energy_min > secs["mid_journey"].energy_min
 
-    def test_afterhours_descends_in_energy(self):
-        """After-hours should have lower energy targets toward the end."""
-        secs = SECTION_PROFILES["afterhours"]
-        # intro energy midpoint > outro energy midpoint
-        intro_mid = (secs[0].energy_min + secs[0].energy_max) / 2
-        outro_mid = (secs[-1].energy_min + secs[-1].energy_max) / 2
-        assert intro_mid > outro_mid
+    def test_intro_lower_energy_than_climax(self):
+        secs = {s.name: s for s in UNIVERSAL_SECTIONS}
+        intro_mid  = (secs["intro"].energy_min  + secs["intro"].energy_max)  / 2
+        climax_mid = (secs["climax"].energy_min + secs["climax"].energy_max) / 2
+        assert intro_mid < climax_mid
+
+    def test_outro_lower_energy_than_climax(self):
+        secs = {s.name: s for s in UNIVERSAL_SECTIONS}
+        outro_mid  = (secs["outro"].energy_min  + secs["outro"].energy_max)  / 2
+        climax_mid = (secs["climax"].energy_min + secs["climax"].energy_max) / 2
+        assert outro_mid < climax_mid
+
+    def test_section_names_include_narrative_acts(self):
+        names = {s.name for s in UNIVERSAL_SECTIONS}
+        for required in ("intro", "mid_journey", "climax", "outro"):
+            assert required in names
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -228,59 +233,59 @@ class TestSectionProfiles:
 class TestDistributeSections:
     def test_total_slots_equals_n(self):
         for n in (5, 10, 16, 24, 40):
-            slots = distribute_sections(n, "peak_time", 120)
+            slots = distribute_sections(n, 120)
             assert len(slots) == n, f"n={n}: got {len(slots)} slots"
 
     def test_section_order_preserved(self):
-        """Slots must maintain narrative order (intro first, outro last)."""
-        slots = distribute_sections(16, "peak_time", 120)
+        """Intro must come before climax, outro must be last."""
+        slots = distribute_sections(16, 120)
         names = [s.section_name for s in slots]
-        # intro must come before climax
         assert names.index("intro") < names.index("climax")
-        # outro must be last group
-        last_section = names[-1]
-        assert last_section == "outro"
-
-    def test_all_profiles_produce_slots(self):
-        for profile in ("peak_time", "warmup", "afterhours"):
-            slots = distribute_sections(16, profile, 120)
-            assert len(slots) == 16
+        assert names[-1] == "outro"
 
     def test_bpm_targets_scaled_to_base(self):
-        slots_80  = distribute_sections(16, "peak_time", 80)
-        slots_140 = distribute_sections(16, "peak_time", 140)
+        slots_80  = distribute_sections(16, 80)
+        slots_140 = distribute_sections(16, 140)
         avg_80  = sum(s.bpm_target for s in slots_80)  / len(slots_80)
         avg_140 = sum(s.bpm_target for s in slots_140) / len(slots_140)
         assert avg_140 > avg_80
 
+    def test_bpm_range_clamps_targets(self):
+        """All BPM targets must fall within the requested range."""
+        slots = distribute_sections(16, 128, bpm_range=(120, 140))
+        for s in slots:
+            assert 120 <= s.bpm_target <= 140, \
+                f"section {s.section_name}: bpm_target {s.bpm_target} outside [120,140]"
+
     def test_climax_slots_are_hit_slots(self):
-        slots = distribute_sections(16, "peak_time", 120)
+        slots = distribute_sections(16, 120)
         climax_slots = [s for s in slots if s.section_name == "climax"]
         assert any(s.is_hit_slot for s in climax_slots)
 
     def test_intro_slots_not_hit_slots(self):
-        slots = distribute_sections(16, "peak_time", 120)
+        slots = distribute_sections(16, 120)
         intro_slots = [s for s in slots if s.section_name == "intro"]
         assert not any(s.is_hit_slot for s in intro_slots)
 
     def test_positions_are_contiguous(self):
-        slots = distribute_sections(16, "peak_time", 120)
-        positions = [s.position for s in slots]
-        assert positions == list(range(16))
-
-    def test_unknown_profile_falls_back(self):
-        slots = distribute_sections(16, "unknown", 120)
-        assert len(slots) == 16   # doesn't crash
+        slots = distribute_sections(16, 120)
+        assert [s.position for s in slots] == list(range(16))
 
     def test_large_set(self):
-        slots = distribute_sections(47, "peak_time", 120)
-        assert len(slots) == 47
+        assert len(distribute_sections(47, 120)) == 47
 
     def test_energy_ranges_are_reasonable(self):
-        for profile in ("peak_time", "warmup", "afterhours"):
-            slots = distribute_sections(20, profile, 120)
-            for s in slots:
-                assert s.energy_min < s.energy_max
+        for s in distribute_sections(20, 120):
+            assert s.energy_min < s.energy_max
+
+    def test_no_bpm_range_uses_full_pool(self):
+        """Without bpm_range, targets should span wide (not artificially clamped)."""
+        slots = distribute_sections(16, 120)
+        targets = [s.bpm_target for s in slots]
+        # intro should be below base, climax above
+        intro_bpm  = next(s.bpm_target for s in slots if s.section_name == "intro")
+        climax_bpm = next(s.bpm_target for s in slots if s.section_name == "climax")
+        assert intro_bpm < climax_bpm
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -475,7 +480,7 @@ class TestGenerate:
     def test_sections_summary_in_result(self):
         r = generate(self.library, self.cache, duration_min=60)
         assert "sections" in r
-        assert len(r["sections"]) >= 5   # at least 5 distinct sections
+        assert len(r["sections"]) >= 5
 
     def test_sections_summary_has_required_fields(self):
         r = generate(self.library, self.cache, duration_min=60)
@@ -484,24 +489,22 @@ class TestGenerate:
             assert "start_position" in s and "count" in s
 
     def test_narrative_order(self):
-        """intro must come before climax which must come before outro."""
         r = generate(self.library, self.cache, duration_min=60)
         section_names = [t["section"] for t in r["tracks"]]
-        intro_pos  = next((i for i,s in enumerate(section_names) if s=="intro"),  None)
-        climax_pos = next((i for i,s in enumerate(section_names) if s=="climax"), None)
-        outro_pos  = next((i for i,s in enumerate(section_names) if s=="outro"),  None)
-        if intro_pos and climax_pos:
+        intro_pos  = next((i for i, s in enumerate(section_names) if s == "intro"),  None)
+        climax_pos = next((i for i, s in enumerate(section_names) if s == "climax"), None)
+        outro_pos  = next((i for i, s in enumerate(section_names) if s == "outro"),  None)
+        if intro_pos is not None and climax_pos is not None:
             assert intro_pos < climax_pos
-        if climax_pos and outro_pos:
+        if climax_pos is not None and outro_pos is not None:
             assert climax_pos < outro_pos
 
-    def test_peak_time_has_valley(self):
-        """mid_journey (valley) should have lower avg energy than peak_a and climax."""
-        r = generate(self.library, self.cache, duration_min=90, energy_profile="peak_time")
+    def test_has_valley(self):
+        """mid_journey energy should be lower than climax energy on average."""
+        r = generate(self.library, self.cache, duration_min=90)
         by_section = {}
         for t in r["tracks"]:
-            s = t["section"]
-            by_section.setdefault(s, []).append(t["energy"])
+            by_section.setdefault(t["section"], []).append(t["energy"])
         if "mid_journey" in by_section and "climax" in by_section:
             avg_valley = sum(by_section["mid_journey"]) / len(by_section["mid_journey"])
             avg_climax = sum(by_section["climax"])      / len(by_section["climax"])
@@ -514,14 +517,19 @@ class TestGenerate:
 
     def test_approximate_duration(self):
         r = generate(self.library, self.cache, duration_min=60)
-        minutes = r["total_duration_ms"] / 60_000
-        assert 25 <= minutes <= 90
+        assert 25 <= r["total_duration_ms"] / 60_000 <= 90
 
-    def test_all_profiles_produce_sections(self):
-        for profile in ("warmup", "peak_time", "afterhours"):
-            r = generate(self.library, self.cache, duration_min=40, energy_profile=profile)
-            assert r["track_count"] > 0
-            assert len(r["sections"]) >= 3
+    def test_bpm_range_filter_respected(self):
+        """Tracks should come from the requested BPM range when enough are available."""
+        r = generate(self.library, self.cache, duration_min=30, bpm_range=(108, 120))
+        # BPM range is applied so base_bpm should reflect it
+        if not r.get("warnings"):
+            for t in r["tracks"]:
+                assert 95 <= t["bpm"] <= 135, f"BPM {t['bpm']} far outside requested range"
+
+    def test_bpm_range_warning_when_insufficient(self):
+        r = generate(self.library, self.cache, duration_min=60, bpm_range=(1, 2))
+        assert any("BPM" in w for w in r.get("warnings", []))
 
     def test_empty_cache_returns_error(self):
         r = generate(self.library, {})
@@ -550,14 +558,11 @@ class TestGenerate:
                      if abs(tracks[i]["bpm"] - tracks[i-1]["bpm"]) <= 18)
         assert smooth / (len(tracks) - 1) >= 0.65
 
-    def test_afterhours_opening_energy_higher_than_outro(self):
-        r = generate(self.library, self.cache, duration_min=60, energy_profile="afterhours")
-        by_s = {}
-        for t in r["tracks"]:
-            by_s.setdefault(t["section"], []).append(t["energy"])
-        if "intro" in by_s and "outro" in by_s:
-            assert sum(by_s["intro"]) / len(by_s["intro"]) > \
-                   sum(by_s["outro"]) / len(by_s["outro"])
+    def test_no_bpm_range_uses_full_library(self):
+        """Without bpm_range, all analyzed tracks are candidates."""
+        r = generate(self.library, self.cache, duration_min=60)
+        assert r["track_count"] > 0
+        assert not any("BPM" in w for w in r.get("warnings", []))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -609,15 +614,18 @@ class TestPersistence:
         assert "sections" in pl
         assert len(pl["sections"]) >= 3
 
-    def test_create_playlist_auto_name_peak_time(self):
+    def test_create_playlist_auto_name_with_bpm_range(self):
         lib = _make_library(25); cache = _make_cache(lib)
-        pl  = create_playlist(generate(lib, cache, duration_min=30), {"energy_profile": "peak_time"})
-        assert "Peak Time" in pl["name"]
+        pl  = create_playlist(
+            generate(lib, cache, duration_min=30, bpm_range=(120, 135)),
+            {"bpm_range": [120, 135]},
+        )
+        assert "120" in pl["name"] and "135" in pl["name"]
 
-    def test_create_playlist_auto_name_warmup(self):
+    def test_create_playlist_auto_name_without_bpm_range(self):
         lib = _make_library(25); cache = _make_cache(lib)
-        pl  = create_playlist(generate(lib, cache, duration_min=30), {"energy_profile": "warmup"})
-        assert "Warm-Up" in pl["name"]
+        pl  = create_playlist(generate(lib, cache, duration_min=30), {})
+        assert "DJ Set" in pl["name"]
 
     def test_delete_playlist(self):
         lib = _make_library(25); cache = _make_cache(lib)

@@ -248,27 +248,26 @@ function exportCSV() {
 // Playlists tab
 // ─────────────────────────────────────────────────────────────
 
-function selectProfile(btn) {
-  document.querySelectorAll("#pl-profile-group .toggle-btn").forEach(b => b.classList.remove("active"));
-  btn.classList.add("active");
-}
-
-function _selectedProfile() {
-  const active = document.querySelector("#pl-profile-group .toggle-btn.active");
-  return active ? active.dataset.val : "peak_time";
-}
-
 async function generatePlaylist() {
   const btn = document.getElementById("pl-generate-btn");
   const status = document.getElementById("pl-gen-status");
   btn.disabled = true;
   status.textContent = "Generating…";
 
+  const bpmMin = parseInt(document.getElementById("pl-bpm-min").value);
+  const bpmMax = parseInt(document.getElementById("pl-bpm-max").value);
+
+  if (bpmMin && bpmMax && bpmMin >= bpmMax) {
+    status.textContent = "BPM min must be less than max.";
+    btn.disabled = false;
+    return;
+  }
+
   const body = {
-    duration_min:   parseInt(document.getElementById("pl-duration").value),
-    energy_profile: _selectedProfile(),
-    genre_filter:   document.getElementById("pl-genre").value || null,
-    name:           document.getElementById("pl-name").value.trim() || null,
+    duration_min: parseInt(document.getElementById("pl-duration").value),
+    genre_filter: document.getElementById("pl-genre").value || null,
+    name:         document.getElementById("pl-name").value.trim() || null,
+    bpm_range:    (bpmMin && bpmMax) ? [bpmMin, bpmMax] : null,
   };
 
   try {
@@ -358,10 +357,13 @@ async function openPLDetail(pid) {
 
   const meta = document.getElementById("pl-detail-meta");
   const params = p.params || {};
+  const bpmLabel = params.bpm_range
+    ? `${params.bpm_range[0]}–${params.bpm_range[1]} BPM`
+    : "";
   meta.innerHTML = `
     <span>${p.track_count} tracks</span>
     <span>${fmtDuration(p.total_duration_ms)}</span>
-    <span>${(params.energy_profile || "").replace("_"," ")}</span>
+    ${bpmLabel ? `<span>${bpmLabel}</span>` : ""}
     ${params.genre_filter ? `<span>${params.genre_filter}</span>` : ""}
   `;
 

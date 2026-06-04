@@ -285,36 +285,30 @@ async def api_generate_playlist(request: Request):
         raise HTTPException(400, "Load tracks first via /api/tracks")
 
     body = await request.json()
-    duration_min    = int(body.get("duration_min", 60))
-    energy_profile  = body.get("energy_profile", "peak_time")
-    genre_filter    = body.get("genre_filter") or None
-    hit_ratio       = float(body.get("hit_ratio", 0.25))
-    bpm_range       = body.get("bpm_range")    # [min, max] or null
-    name            = body.get("name") or None
+    duration_min = int(body.get("duration_min", 60))
+    genre_filter = body.get("genre_filter") or None
+    bpm_range    = body.get("bpm_range")    # [min, max] or null
+    name         = body.get("name") or None
 
     if not 40 <= duration_min <= 180:
         raise HTTPException(400, "duration_min must be between 40 and 180")
-    if energy_profile not in ("warmup", "peak_time", "afterhours"):
-        raise HTTPException(400, "energy_profile must be warmup | peak_time | afterhours")
     if bpm_range:
-        bpm_range = tuple(bpm_range)
+        bpm_range = tuple(int(b) for b in bpm_range)
+        if bpm_range[0] >= bpm_range[1]:
+            raise HTTPException(400, "bpm_range min must be less than max")
 
     cache = load_cache()
     params = {
-        "duration_min":   duration_min,
-        "energy_profile": energy_profile,
-        "genre_filter":   genre_filter,
-        "hit_ratio":      hit_ratio,
-        "bpm_range":      list(bpm_range) if bpm_range else None,
+        "duration_min": duration_min,
+        "genre_filter": genre_filter,
+        "bpm_range":    list(bpm_range) if bpm_range else None,
     }
 
     result = generate_playlist(
         library=library,
         cache=cache,
         duration_min=duration_min,
-        energy_profile=energy_profile,
         genre_filter=genre_filter,
-        hit_ratio=hit_ratio,
         bpm_range=bpm_range,
     )
 

@@ -351,26 +351,25 @@ input[type="range"] {
 }
 #pl-duration-val { font-size: 13px; color: var(--text); min-width: 44px; }
 
-/* ── Toggle button group ── */
-.btn-group { display: flex; gap: 4px; }
-.toggle-btn {
+/* ── BPM range input ── */
+.bpm-range-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.bpm-range-row input {
   background: var(--bg3);
   border: 1px solid var(--border);
-  color: var(--muted);
-  padding: 6px 12px;
+  color: var(--text);
+  padding: 7px 10px;
   border-radius: 6px;
-  font-size: 12px;
-  cursor: pointer;
-  transition: all 0.15s;
-  white-space: nowrap;
+  font-size: 13px;
+  width: 130px;
+  outline: none;
 }
-.toggle-btn:hover { color: var(--text); border-color: #555; }
-.toggle-btn.active {
-  background: rgba(29,185,84,0.15);
-  border-color: var(--accent);
-  color: var(--accent);
-  font-weight: 600;
-}
+.bpm-range-row input:focus { border-color: var(--accent); }
+.bpm-range-sep { color: var(--muted); font-size: 14px; }
+.bpm-hint { font-size: 11px; margin-top: 4px; display: block; }
 .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
 
 /* ── Playlist cards ── */

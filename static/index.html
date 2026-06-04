@@ -105,12 +105,13 @@
             </label>
 
             <label>
-              Style
-              <div class="btn-group" id="pl-profile-group">
-                <button class="toggle-btn" data-val="warmup" onclick="selectProfile(this)">🌅 Warm-Up</button>
-                <button class="toggle-btn active" data-val="peak_time" onclick="selectProfile(this)">🔥 Peak Time</button>
-                <button class="toggle-btn" data-val="afterhours" onclick="selectProfile(this)">🌙 After Hours</button>
+              BPM range
+              <div class="bpm-range-row">
+                <input type="number" id="pl-bpm-min" placeholder="min (e.g. 120)" min="40" max="220" />
+                <span class="bpm-range-sep">–</span>
+                <input type="number" id="pl-bpm-max" placeholder="max (e.g. 135)" min="40" max="220" />
               </div>
+              <span class="bpm-hint muted">Hip Hop 85–100 · House 120–130 · Techno 130–145</span>
             </label>
 
             <label>

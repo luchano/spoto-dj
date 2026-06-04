@@ -1,31 +1,28 @@
 """
 DJ Playlist Generator — narrative arc edition.
 
-Each set tells a story with 7 acts:
+Each set tells a story with 7 universal acts:
 
-  peak_time:   Intro → Build → First Peak → Journey (valley) → Rise → Climax → Outro
-  warmup:      Opening → Build → Lift → Groove → Rise → Peak → Outro
-  afterhours:  In the Zone → Peak → Descent → Deep → Drift → Closing → Fade
+  Intro → Build → First Peak → Journey (valley) → Rise → Climax → Outro
+
+The BPM range (min/max) provided by the user defines the intensity envelope
+of the set. Section BPM targets are derived by scaling the factors against
+the midpoint of that range:
+  - Intro / Outro  →  near bpm_min  (calm opening and closing)
+  - Climax         →  near bpm_max  (peak intensity)
 
 Professional DJs structure sets this way to create tension & release, emotional
 contrast, and memorable moments. The "valley" (mid-journey) is deliberate —
 dropping energy before the climax makes the climax hit much harder.
-
-Data used per track:
-  bpm        → BPM arc (absolute targets per section)
-  energy     → energy arc (section energy ranges)
-  camelot    → harmonic transitions (Camelot wheel)
-  popularity → hit placement (required/avoided per section)
-  duration_ms→ set duration calculation
 """
 
 import json
 import uuid
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 PLAYLISTS_FILE = Path(__file__).parent / ".playlists.json"
 
@@ -150,83 +147,70 @@ class SectionSlot:
     is_hit_slot: bool
 
 
-# Each profile defines 7 sections that sum weights to 1.0
-SECTION_PROFILES: Dict[str, List[SectionDef]] = {
-    # ── Peak-time: full narrative arc, most popular profile ──────────────────
-    "peak_time": [
-        SectionDef("intro",       "Intro",       "🎵", 0.12, 25, 50, 0.92,  0,  70),
-        SectionDef("build",       "Build",       "📈", 0.18, 45, 70, 0.97,  0,  85),
-        SectionDef("peak_a",      "First Peak",  "🔥", 0.12, 70, 90, 1.02, 55, 100),
-        SectionDef("mid_journey", "Journey",     "🌊", 0.18, 50, 68, 0.95,  0,  75),
-        SectionDef("escalation",  "Rise",        "⬆",  0.18, 65, 88, 1.02,  0,  90),
-        SectionDef("climax",      "Climax",      "💥", 0.12, 82, 100, 1.07, 60, 100),
-        SectionDef("outro",       "Outro",       "🌅", 0.10, 35, 62, 0.93,  0,  70),
-    ],
-    # ── Warm-up: starts gentle, peaks in the latter half ─────────────────────
-    "warmup": [
-        SectionDef("intro",       "Opening",     "🎵", 0.15, 20, 42, 0.88,  0,  65),
-        SectionDef("build",       "Build",       "📈", 0.22, 35, 60, 0.94,  0,  80),
-        SectionDef("peak_a",      "Lift",        "🔥", 0.15, 55, 75, 1.00, 45, 100),
-        SectionDef("mid_journey", "Groove",      "🌊", 0.18, 45, 65, 0.96,  0,  72),
-        SectionDef("escalation",  "Rise",        "⬆",  0.15, 60, 80, 1.00,  0,  88),
-        SectionDef("climax",      "Peak",        "💥", 0.10, 70, 92, 1.04, 55, 100),
-        SectionDef("outro",       "Outro",       "🌅", 0.05, 30, 55, 0.92,  0,  65),
-    ],
-    # ── After-hours: high energy opening, descends into a deep journey ────────
-    "afterhours": [
-        SectionDef("intro",       "In the Zone", "🌙", 0.12, 65, 88, 1.02, 50, 100),
-        SectionDef("build",       "Peak",        "💫", 0.15, 80, 100, 1.06, 60, 100),
-        SectionDef("peak_a",      "Descent",     "🌊", 0.18, 58, 80, 0.99,  0,  90),
-        SectionDef("mid_journey", "Deep",        "🔮", 0.20, 42, 65, 0.95,  0,  72),
-        SectionDef("escalation",  "Drift",       "✨",  0.18, 32, 58, 0.93,  0,  78),
-        SectionDef("climax",      "Closing",     "🌅", 0.10, 22, 50, 0.90,  0,  65),
-        SectionDef("outro",       "Fade",        "🌃", 0.07, 15, 40, 0.87,  0,  55),
-    ],
-}
+# Universal 7-section narrative arc (weights sum to 1.0).
+# BPM targets are derived at runtime from the user's bpm_range,
+# not hardcoded per profile.
+UNIVERSAL_SECTIONS: List[SectionDef] = [
+    #              name           label          emoji  wt    emin emax bfactor pmin pmax
+    SectionDef("intro",       "Intro",       "🎵", 0.12, 25,  50, 0.92,  0,  70),
+    SectionDef("build",       "Build",       "📈", 0.18, 45,  70, 0.97,  0,  85),
+    SectionDef("peak_a",      "First Peak",  "🔥", 0.12, 70,  90, 1.02, 55, 100),
+    SectionDef("mid_journey", "Journey",     "🌊", 0.18, 50,  68, 0.95,  0,  75),
+    SectionDef("escalation",  "Rise",        "⬆",  0.18, 65,  88, 1.02,  0,  90),
+    SectionDef("climax",      "Climax",      "💥", 0.12, 82, 100, 1.07, 60, 100),
+    SectionDef("outro",       "Outro",       "🌅", 0.10, 35,  62, 0.93,  0,  70),
+]
 
 
-def compute_base_bpm(pool: list) -> int:
-    """Return the median BPM of the pool, used as the reference for section targets."""
+def compute_base_bpm(pool: list, bpm_range: Optional[Tuple[int, int]] = None) -> int:
+    """Return the median BPM of the pool (optionally filtered to bpm_range)."""
     bpms = [t["bpm"] for t in pool if t["bpm"] > 0]
-    if not bpms:
-        return 120
-    return round(median(bpms))
+    if bpm_range:
+        lo, hi   = bpm_range
+        filtered = [b for b in bpms if lo <= b <= hi]
+        if filtered:
+            bpms = filtered
+    return round(median(bpms)) if bpms else 120
 
 
-def distribute_sections(n_tracks: int, profile: str, base_bpm: int) -> List[SectionSlot]:
-    """Assign *n_tracks* to sections and return ordered SectionSlot list.
+def distribute_sections(
+    n_tracks: int,
+    base_bpm: int,
+    bpm_range: Optional[Tuple[int, int]] = None,
+) -> List[SectionSlot]:
+    """Assign *n_tracks* to the universal 7-section narrative arc.
 
-    Each section gets at least 0 tracks; sections with weight>0 are preferred.
-    Hit slots are placed at the climactic positions of each "peak" section.
+    BPM targets are scaled from *base_bpm* using each section's factor,
+    then clamped to *bpm_range* when provided so every slot stays within
+    the requested BPM envelope.
     """
-    defs = SECTION_PROFILES.get(profile, SECTION_PROFILES["peak_time"])
+    defs      = UNIVERSAL_SECTIONS
+    bpm_lo    = bpm_range[0] if bpm_range else 0
+    bpm_hi    = bpm_range[1] if bpm_range else 9999
 
-    # Proportional allocation with floor + fractional-remainder distribution
-    weights     = [d.weight for d in defs]
-    total_w     = sum(weights)
-    raw_counts  = [w / total_w * n_tracks for w in weights]
-    counts      = [int(c) for c in raw_counts]
-    remainder   = n_tracks - sum(counts)
-
-    fracs = sorted(enumerate(raw_counts), key=lambda x: x[1] - int(x[1]), reverse=True)
+    # Proportional allocation, floor + fractional-remainder
+    weights    = [d.weight for d in defs]
+    total_w    = sum(weights)
+    raw_counts = [w / total_w * n_tracks for w in weights]
+    counts     = [int(c) for c in raw_counts]
+    remainder  = n_tracks - sum(counts)
+    fracs      = sorted(enumerate(raw_counts), key=lambda x: x[1] - int(x[1]), reverse=True)
     for i, _ in fracs[:remainder]:
         counts[i] += 1
 
-    # Build slot list
     slots: List[SectionSlot] = []
     pos = 0
     for sec_def, count in zip(defs, counts):
         if count == 0:
             continue
-        bpm_t    = max(60, round(base_bpm * sec_def.bpm_factor))
-        target_e = (sec_def.energy_min + sec_def.energy_max) / 200.0  # normalised
+        raw_bpm = round(base_bpm * sec_def.bpm_factor)
+        bpm_t   = max(bpm_lo, min(bpm_hi, max(60, raw_bpm)))
+        target_e = (sec_def.energy_min + sec_def.energy_max) / 200.0
 
         for j in range(count):
-            # Hit slots: last position in first-peak, first 2 positions in climax
             is_hit = (
-                (sec_def.name == "peak_a"  and j == count - 1) or
-                (sec_def.name == "climax"  and j <= 1) or
-                (sec_def.name == "build"   and sec_def.pop_min >= 40 and j == count - 1)
+                (sec_def.name == "peak_a" and j == count - 1) or
+                (sec_def.name == "climax" and j <= 1)
             )
             slots.append(SectionSlot(
                 section_name  = sec_def.name,
@@ -439,28 +423,32 @@ def generate(
     library: list,
     cache: dict,
     duration_min: int                   = 60,
-    energy_profile: str                 = "peak_time",
     genre_filter: Optional[str]         = None,
-    hit_ratio: float                    = 0.25,   # kept for API compatibility
     bpm_range: Optional[Tuple[int,int]] = None,
 ) -> dict:
     """Generate a narrative-arc DJ set.
 
+    Parameters
+    ----------
+    library      : track dicts from build_track_library()
+    cache        : analysis cache from load_cache()
+    duration_min : target set length in minutes (40-180)
+    genre_filter : optional genre cluster to restrict pool
+    bpm_range    : (min_bpm, max_bpm) — defines the intensity envelope.
+                   Section BPM targets are scaled within this range.
+                   When omitted, the pool's full BPM range is used.
+
     Returns a dict with keys:
-        tracks            – ordered list of enriched track dicts (with section info)
-        total_duration_ms – effective duration (accounting for 15 s overlaps)
-        track_count
-        warnings          – human-readable warning strings
-        sections          – ordered list of section summary dicts for the UI
+        tracks, total_duration_ms, track_count, warnings, sections
     """
     warnings: List[str] = []
 
-    # ── Build and filter pool ────────────────────────────────────────────────
+    # ── Build pool ───────────────────────────────────────────────────────────
     full_pool = build_pool(library, cache)
     if not full_pool:
         return {
-            "error":   "No analysed tracks available. Run analysis first.",
-            "tracks":  [], "total_duration_ms": 0, "track_count": 0,
+            "error":    "No analysed tracks available. Run analysis first.",
+            "tracks":   [], "total_duration_ms": 0, "track_count": 0,
             "warnings": [], "sections": [],
         }
 
@@ -478,14 +466,16 @@ def generate(
             )
 
     if bpm_range:
-        lo, hi    = bpm_range
-        bpm_pool  = [t for t in pool if lo <= t["bpm"] <= hi]
+        lo, hi   = bpm_range
+        bpm_pool = [t for t in pool if lo <= t["bpm"] <= hi]
         if len(bpm_pool) >= 8:
             pool = bpm_pool
         else:
             warnings.append(
-                f"Only {len(bpm_pool)} tracks in BPM {bpm_range}. Ignoring filter."
+                f"Only {len(bpm_pool)} tracks in BPM {bpm_range[0]}–{bpm_range[1]}. "
+                "Ignoring BPM filter."
             )
+            bpm_range = None   # don't clamp section BPM targets either
 
     # ── Set-wide parameters ──────────────────────────────────────────────────
     n_tracks = max(5, round(duration_min / 3.75))
@@ -495,8 +485,8 @@ def generate(
             f"Only {len(pool)} eligible tracks; set will be shorter than requested."
         )
 
-    base_bpm = compute_base_bpm(pool)
-    slots    = distribute_sections(n_tracks, energy_profile, base_bpm)
+    base_bpm = compute_base_bpm(pool, bpm_range)
+    slots    = distribute_sections(n_tracks, base_bpm, bpm_range)
 
     # ── Greedy section-by-section selection ─────────────────────────────────
     selected: List[dict]  = []
@@ -589,13 +579,11 @@ def create_playlist(result: dict, params: dict, name: Optional[str] = None) -> d
             "image_url":     t.get("image_url", ""),
         })
 
-    profile_label = {
-        "warmup": "Warm-Up", "peak_time": "Peak Time", "afterhours": "After Hours",
-    }.get(params.get("energy_profile", "peak_time"), "DJ Set")
-
     duration_min = round(result["total_duration_ms"] / 60_000)
+    bpm_range    = params.get("bpm_range")
+    bpm_label    = f"{bpm_range[0]}–{bpm_range[1]} BPM" if bpm_range else f"{duration_min}min"
     auto_name    = name or (
-        f"{profile_label} {duration_min}min — {datetime.now(timezone.utc).strftime('%b %d')}"
+        f"DJ Set {bpm_label} — {datetime.now(timezone.utc).strftime('%b %d')}"
     )
 
     playlist = {
