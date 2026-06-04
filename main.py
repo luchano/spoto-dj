@@ -138,7 +138,7 @@ async def callback(request: Request, code: str = "", state: str = "", error: str
         raise HTTPException(400, "State mismatch — possible CSRF")
     _pending_states.discard(state)
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.post(
             SPOTIFY_TOKEN_URL,
             data={
@@ -151,14 +151,16 @@ async def callback(request: Request, code: str = "", state: str = "", error: str
         resp.raise_for_status()
         token_data = resp.json()
 
-    # Fetch Spotify user ID for playlist export
-    async with httpx.AsyncClient() as client:
-        me_resp = await client.get(
-            "https://api.spotify.com/v1/me",
-            headers={"Authorization": f"Bearer {token_data['access_token']}"},
-        )
-        if me_resp.status_code == 200:
-            token_data["spotify_user_id"] = me_resp.json().get("id", "")
+        # Fetch Spotify user ID for playlist export (optional — don't crash auth if it fails)
+        try:
+            me_resp = await client.get(
+                "https://api.spotify.com/v1/me",
+                headers={"Authorization": f"Bearer {token_data['access_token']}"},
+            )
+            if me_resp.status_code == 200:
+                token_data["spotify_user_id"] = me_resp.json().get("id", "")
+        except Exception as e:
+            log.warning("Could not fetch Spotify user ID (export will require re-login): %s", e)
 
     session_id = secrets.token_urlsafe(32)
     response = RedirectResponse("/")
