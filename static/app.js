@@ -122,8 +122,14 @@ function applyAnalysisResults(results) {
   let changed = false;
   allTracks.forEach(t => {
     const r = results[t.id];
-    if (r && !r.error && t.bpm === 0) {
+    if (!r || r.error) return;
+    if (t.bpm === 0) {
       t.bpm = r.bpm; t.key = r.key; t.camelot = r.camelot; t.energy = r.energy;
+      changed = true;
+    }
+    // Replace artist-level genres with track-specific Last.fm tags when available
+    if (r.track_genres && r.track_genres.length) {
+      t.genres = r.track_genres;
       changed = true;
     }
   });
