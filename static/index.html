@@ -58,6 +58,7 @@
         </div>
         <div class="toolbar-right">
           <span id="track-count" class="muted"></span>
+          <button id="refresh-genres-btn" class="btn-ghost small" onclick="startAnalysis()">Actualizar géneros</button>
           <button class="btn-ghost small" onclick="exportCSV()">Export CSV</button>
         </div>
       </div>
@@ -69,7 +70,8 @@
               <th></th>
               <th data-col="title" onclick="sortBy('title')">Title <span class="sort-icon">⇅</span></th>
               <th data-col="artists" onclick="sortBy('artists')">Artists <span class="sort-icon">⇅</span></th>
-              <th data-col="genres">Genres</th>
+              <th data-col="genres">Spotify Genres</th>
+              <th data-col="track_genres">Last.fm Genres</th>
               <th data-col="bpm" onclick="sortBy('bpm')">BPM <span class="sort-icon">⇅</span></th>
               <th data-col="camelot" onclick="sortBy('camelot')">Camelot <span class="sort-icon">⇅</span></th>
               <th data-col="key">Key</th>
@@ -117,13 +119,7 @@
             <label>
               Genre focus
               <select id="pl-genre">
-                <option value="">All genres</option>
-                <option value="electronic">Electronic</option>
-                <option value="hip_hop">Hip Hop</option>
-                <option value="latin">Latin</option>
-                <option value="rock">Rock</option>
-                <option value="pop">Pop</option>
-                <option value="jazz">Jazz / Soul</option>
+                <option value="">Todos los géneros</option>
               </select>
             </label>
 
@@ -174,6 +170,6 @@
     <p class="muted">BPM &amp; key data powered by <a href="https://getsongbpm.com" target="_blank" rel="noopener">GetSongBPM</a></p>
   </footer>
 
-  <script src="/static/app.js"></script>
+  <script src="/static/app.js?v=4"></script>
 </body>
 </html>

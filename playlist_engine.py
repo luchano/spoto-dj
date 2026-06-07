@@ -259,31 +259,141 @@ def classify_track_role(track: dict, base_bpm: int) -> str:
 # Genre clustering
 # ─────────────────────────────────────────────────────────────────────────────
 
-_GENRE_KEYWORDS = {
-    "electronic": {
-        "electronic", "house", "techno", "edm", "dance", "electronica",
-        "tech house", "deep house", "progressive house", "minimal", "trance",
-        "drum and bass", "dnb", "dubstep", "electro", "synth", "disco",
-        "microhouse", "ambient", "downtempo",
-    },
-    "hip_hop": {"hip hop", "hip-hop", "rap", "trap", "r&b", "rnb", "urban", "drill", "grime"},
-    "latin":   {"latin", "reggaeton", "salsa", "cumbia", "bachata", "latin pop", "dembow", "perreo", "tropical"},
-    "rock":    {"rock", "indie", "alternative", "punk", "metal", "grunge", "shoegaze", "post-rock"},
-    "pop":     {"pop", "dance pop", "electropop", "synth-pop", "k-pop", "teen pop", "pop rock"},
-    "jazz":    {"jazz", "blues", "soul", "funk", "bossa nova", "bebop", "neo soul"},
-}
+import re
+
+# Genre clusters: (key, human label, set of member tags in NORMALISED form).
+# Normalised = lowercased with spaces/hyphens stripped, so "deep house",
+# "deep-house" and "deephouse" all collapse to "deephouse" and match here.
+# A tag may belong to several clusters (e.g. "indie pop" → indie AND pop);
+# membership is intentionally overlapping so filtering stays inclusive.
+# Order defines display order in the dropdown before the count-based sort.
+GENRE_CLUSTERS = [
+    ("electronic", "Electrónica", {
+        "electronic", "electronica", "house", "deephouse", "techhouse",
+        "chillhouse", "microhouse", "minimal", "minimaltechno", "techno",
+        "dance", "electro", "edm", "idm", "kompakt", "trance", "drumandbass",
+        "dnb", "dubstep", "progressivehouse", "breakbeat", "garage", "ukgarage",
+        "futuregarage", "glitch", "electroclash", "electronicdance", "nudisco",
+        "acidhouse", "melodichouse", "organichouse", "deeptech",
+    }),
+    ("downtempo", "Downtempo / Chill", {
+        "downtempo", "chillout", "chill", "chillwave", "lounge", "triphop",
+        "ambient", "lofi", "downbeat", "balearic", "easylistening",
+    }),
+    ("indie", "Indie", {
+        "indie", "indierock", "indiepop", "dreampop", "indietronica",
+        "bedroompop", "janglepop", "indiefolk",
+    }),
+    ("rock", "Rock", {
+        "rock", "alternative", "alternativerock", "rockargentino", "punk",
+        "postpunk", "postrock", "metal", "grunge", "shoegaze", "psychedelicrock",
+        "psychedelic", "newwave", "garagerock", "hardrock", "classicrock",
+        "bluesrock", "indierock", "poprock", "softrock",
+    }),
+    ("pop", "Pop", {
+        "pop", "synthpop", "electropop", "artpop", "dancepop", "kpop",
+        "poprock", "powerpop", "hyperpop", "dreampop", "indiepop", "bedroompop",
+        "chamberpop",
+    }),
+    ("hip_hop", "Hip-Hop / R&B", {
+        "hiphop", "rap", "trap", "poprap", "rnb", "r&b", "neosoul", "drill",
+        "grime", "urban", "boombap", "conscioushiphop",
+    }),
+    ("jazz", "Jazz / Soul / Funk", {
+        "jazz", "soul", "funk", "blues", "disco", "bossanova", "bebop",
+        "neosoul", "swing", "bluesrock", "nujazz", "jazzfunk", "acidjazz",
+        "motown", "souljazz",
+    }),
+    ("latin", "Latino", {
+        "latin", "latinpop", "latinalternative", "latinelectronic", "cumbia",
+        "digitalcumbia", "electrocumbia", "electrocumbe", "reggaeton", "dembow",
+        "perreo", "salsa", "bachata", "tropical", "mpb", "latinjazz",
+        "merengue", "champeta", "rockargentino", "bossanova",
+    }),
+    ("folk", "Folk / Acústico", {
+        "folk", "acoustic", "indiefolk", "singersongwriter", "americana",
+        "country", "countrypop", "folkpop", "folkrock", "altcountry",
+        "bluegrass", "neofolk",
+    }),
+    ("world", "World / Reggae", {
+        "world", "worldmusic", "reggae", "dub", "dancehall", "ska", "afrobeat",
+        "balkan", "gypsy", "roots", "worldfusion", "afro",
+    }),
+    ("classical", "Clásica / Instrumental", {
+        "classical", "piano", "instrumental", "soundtrack", "score",
+        "neoclassical", "modernclassical", "orchestral", "contemporaryclassical",
+    }),
+]
+
+# Human-readable label per cluster key, for the UI.
+GENRE_LABELS = {key: label for key, label, _ in GENRE_CLUSTERS}
+
+_YEAR_RE = re.compile(r"^(19|20)\d{2}s?$")
+
+
+def _normalize_tag(tag: str) -> str:
+    """Lowercase a tag and strip everything but a-z/0-9/&, so separator
+    variants collapse ('deep house' / 'deep-house' → 'deephouse')."""
+    return re.sub(r"[^a-z0-9&]", "", tag.lower())
+
+
+def tags_to_clusters(genres: list) -> set:
+    """Every cluster key that any of the given tags belongs to (may be empty)."""
+    norm = {_normalize_tag(g) for g in genres if g}
+    norm.discard("")
+    return {
+        key for key, _, members in GENRE_CLUSTERS
+        if norm & members
+    }
 
 
 def classify_genre(genres: list) -> Optional[str]:
+    """Single best-fit cluster (highest number of matching tags), or None.
+
+    Kept for backward compatibility / display; filtering uses the full
+    multi-membership set from tags_to_clusters() instead.
+    """
     if not genres:
         return None
-    text = " ".join(g.lower() for g in genres)
+    norm = [_normalize_tag(g) for g in genres]
+    norm = [n for n in norm if n]
     scores = {
-        cluster: sum(1 for kw in keywords if kw in text)
-        for cluster, keywords in _GENRE_KEYWORDS.items()
+        key: sum(1 for n in norm if n in members)
+        for key, _, members in GENRE_CLUSTERS
     }
-    best = max(scores, key=scores.get)
-    return best if scores[best] > 0 else None
+    best = max(scores, key=scores.get) if scores else None
+    return best if best and scores[best] > 0 else None
+
+
+def _track_tags(library_track: dict, analysis: dict) -> list:
+    """Combine Spotify artist genres + Last.fm track tags for one track."""
+    return list(library_track.get("genres", [])) + list(analysis.get("track_genres", []))
+
+
+def genre_options(library: list, cache: dict, min_tracks: int = 8) -> list:
+    """Dropdown options derived from the user's own library.
+
+    Counts, per cluster, how many analysed tracks match it (using both Spotify
+    and Last.fm tags), and returns only clusters with at least `min_tracks`,
+    sorted by count descending. Shape: [{"value", "label", "count"}, ...].
+    """
+    counts: dict = {key: 0 for key, _, _ in GENRE_CLUSTERS}
+    for t in library:
+        analysis = cache.get(t["id"], {})
+        if not analysis or "error" in analysis:
+            continue
+        if not (analysis.get("bpm") or 0):
+            continue
+        for cluster in tags_to_clusters(_track_tags(t, analysis)):
+            counts[cluster] += 1
+
+    options = [
+        {"value": key, "label": GENRE_LABELS[key], "count": counts[key]}
+        for key, _, _ in GENRE_CLUSTERS
+        if counts[key] >= min_tracks
+    ]
+    options.sort(key=lambda o: o["count"], reverse=True)
+    return options
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -310,20 +420,22 @@ def build_pool(library: list, cache: dict) -> list:
             artists_str  = artists_raw
             artists_list = [a.strip() for a in artists_raw.split(",") if a.strip()]
 
+        tags = _track_tags(t, analysis)   # Spotify artist genres + Last.fm track tags
         pool.append({
-            "id":            tid,
-            "title":         t.get("title", ""),
-            "artists":       artists_str,
-            "artists_list":  artists_list,
-            "bpm":           bpm,
-            "camelot":       analysis.get("camelot") or t.get("camelot") or "?",
-            "energy":        analysis.get("energy")  or t.get("energy")  or 0,
-            "duration_ms":   t.get("duration_ms", 240_000),
-            "popularity":    t.get("popularity", 0),
-            "genres":        t.get("genres", []),
-            "genre_cluster": classify_genre(t.get("genres", [])),
-            "spotify_url":   t.get("spotify_url", ""),
-            "image_url":     t.get("image_url", ""),
+            "id":             tid,
+            "title":          t.get("title", ""),
+            "artists":        artists_str,
+            "artists_list":   artists_list,
+            "bpm":            bpm,
+            "camelot":        analysis.get("camelot") or t.get("camelot") or "?",
+            "energy":         analysis.get("energy")  or t.get("energy")  or 0,
+            "duration_ms":    t.get("duration_ms", 240_000),
+            "popularity":     t.get("popularity", 0),
+            "genres":         t.get("genres", []),
+            "genre_cluster":  classify_genre(tags),      # primary, for display
+            "genre_clusters": tags_to_clusters(tags),    # all clusters, for filtering
+            "spotify_url":    t.get("spotify_url", ""),
+            "image_url":      t.get("image_url", ""),
         })
     return pool
 
@@ -455,15 +567,24 @@ def generate(
     pool = full_pool
 
     if genre_filter:
-        genre_pool = [t for t in full_pool if t["genre_cluster"] == genre_filter]
+        # Strict: only tracks belonging to the chosen genre's cluster. If there
+        # aren't enough for the requested duration we warn and build a shorter
+        # set — we never pull in tracks from outside the cluster.
+        genre_pool = [t for t in full_pool if genre_filter in t["genre_clusters"]]
+        label = GENRE_LABELS.get(genre_filter, genre_filter)
+        if not genre_pool:
+            return {
+                "error":    f"No hay canciones del género '{label}' en tu librería analizada.",
+                "tracks":   [], "total_duration_ms": 0, "track_count": 0,
+                "warnings": [], "sections": [],
+            }
         needed = round(duration_min / 3.5) * 2
-        if len(genre_pool) >= needed:
-            pool = genre_pool
-        else:
+        if len(genre_pool) < needed:
             warnings.append(
-                f"Not enough '{genre_filter}' tracks ({len(genre_pool)}, need ~{needed}). "
-                "Using full library."
+                f"Solo {len(genre_pool)} canciones de '{label}' — el set será más corto "
+                "que la duración pedida (no se agregan canciones de otros géneros)."
             )
+        pool = genre_pool
 
     if bpm_range:
         lo, hi   = bpm_range

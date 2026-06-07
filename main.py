@@ -16,7 +16,7 @@ from getsongbpm import lookup_track, QUOTA_EXCEEDED as _GETSONGBPM_QUOTA
 from lastfm import lookup_track_tags as _lastfm_tags
 from playlist_engine import (
     create_playlist, delete_playlist, generate as generate_playlist,
-    load_playlists, save_playlists,
+    genre_options, load_playlists, save_playlists,
 )
 from spotify import build_track_library
 
@@ -110,11 +110,12 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
         title  = track.get("title", "")
         artists = track.get("artists", [])
         primary = _primary_artist(track)
+        album   = track.get("album", "")
 
         async with httpx.AsyncClient() as client:
             (track_id, bpm_result), lfm_tags = await asyncio.gather(
                 lookup_track(GETSONGBPM_API_KEY, track["id"], title, artists, client, bpm_sem),
-                _lastfm_tags(LASTFM_API_KEY, title, primary, client, lfm_sem),
+                _lastfm_tags(LASTFM_API_KEY, title, primary, client, lfm_sem, album),
             )
 
         # None = network error → don't cache (retry next session)
@@ -128,9 +129,10 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
         tid    = track["id"]
         title  = track.get("title", "")
         primary = _primary_artist(track)
+        album   = track.get("album", "")
 
         async with httpx.AsyncClient() as client:
-            lfm_tags = await _lastfm_tags(LASTFM_API_KEY, title, primary, client, lfm_sem)
+            lfm_tags = await _lastfm_tags(LASTFM_API_KEY, title, primary, client, lfm_sem, album)
 
         # None = network error → don't cache; [] = not found → cache to skip next session
         if lfm_tags is not None:
@@ -270,13 +272,13 @@ async def tracks(request: Request):
         library = await build_track_library(access_token)
         _track_cache[access_token] = library
 
-    # Merge per-track Last.fm genre tags from the audio cache, overriding
-    # the artist-level Spotify genres for any track that has a non-empty result.
-    # track_genres=[] means Last.fm returned nothing — keep Spotify genres in that case.
+    # Merge per-track Last.fm genre tags from the audio cache as a SEPARATE field
+    # (`track_genres`) so the frontend can show Spotify artist genres and Last.fm
+    # track genres side by side. The Spotify `genres` field is left untouched.
     audio_cache = load_cache()
     if any(audio_cache.get(t["id"], {}).get("track_genres") for t in library):
         library = [
-            {**t, "genres": audio_cache[t["id"]]["track_genres"]}
+            {**t, "track_genres": audio_cache[t["id"]]["track_genres"]}
             if audio_cache.get(t["id"], {}).get("track_genres")
             else t
             for t in library
@@ -306,14 +308,17 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
     _analysis_state["results"] = {k: v for k, v in cache.items() if "error" not in v}
     to_analyze = [t for t in library if t["id"] not in cache]
 
-    # Tracks in cache but missing Last.fm genre tags → backfill silently alongside BPM analysis
+    # Tracks in cache but with no Last.fm genre tags → backfill silently alongside
+    # BPM analysis. We re-query empty results too (not just missing ones): the
+    # fallback chain (track → album → artist) now resolves nearly everything, so
+    # previously-empty entries are worth another look.
     to_genre_backfill: list[dict] = []
     if LASTFM_API_KEY:
         to_genre_backfill = [
             t for t in library
             if t["id"] in cache
             and "error" not in cache[t["id"]]
-            and "track_genres" not in cache[t["id"]]
+            and not cache[t["id"]].get("track_genres")
         ]
 
     cached_ok = sum(1 for v in cache.values() if "error" not in v)
@@ -376,6 +381,19 @@ async def list_playlists(request: Request):
     ]
     summaries.sort(key=lambda x: x["created_at"], reverse=True)
     return JSONResponse(summaries)
+
+
+@app.get("/api/playlists/genres")
+async def api_genre_options(request: Request):
+    """Genre dropdown options derived from the user's own analysed library."""
+    session = _get_session(request)
+    access_token = session.get("access_token")
+    if not access_token:
+        raise HTTPException(401, "Not authenticated")
+
+    library = _track_cache.get(access_token, [])
+    options = genre_options(library, load_cache()) if library else []
+    return JSONResponse({"genres": options})
 
 
 @app.post("/api/playlists/generate")
