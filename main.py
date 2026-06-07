@@ -21,7 +21,28 @@ from playlist_engine import (
 from spotify import build_track_library
 
 log = logging.getLogger("spoto")
-logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
+
+# ── logging: console + rotating file ─────────────────────────────────────────
+_LOG_FMT = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
+_LOG_DATE = "%Y-%m-%d %H:%M:%S"
+
+from logging.handlers import RotatingFileHandler as _RFH
+
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+
+_console = logging.StreamHandler()
+_console.setFormatter(logging.Formatter(_LOG_FMT, datefmt=_LOG_DATE))
+_root.addHandler(_console)
+
+_file_handler = _RFH(
+    Path(__file__).parent / "server.log",
+    maxBytes=10 * 1024 * 1024,  # 10 MB per file
+    backupCount=3,
+    encoding="utf-8",
+)
+_file_handler.setFormatter(logging.Formatter(_LOG_FMT, datefmt=_LOG_DATE))
+_root.addHandler(_file_handler)
 
 load_dotenv()
 
