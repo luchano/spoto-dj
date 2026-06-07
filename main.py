@@ -96,8 +96,9 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
                 _lastfm_tags(LASTFM_API_KEY, title, primary, client, lfm_sem),
             )
 
-        # lfm_tags is None on network error (don't cache), [] if not found (also skip)
-        if lfm_tags:
+        # None = network error → don't cache (retry next session)
+        # []   = not found   → cache as empty so we don't re-query next session
+        if lfm_tags is not None:
             bpm_result["track_genres"] = lfm_tags
         return track_id, bpm_result
 
@@ -110,10 +111,11 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
         async with httpx.AsyncClient() as client:
             lfm_tags = await _lastfm_tags(LASTFM_API_KEY, title, primary, client, lfm_sem)
 
-        if lfm_tags:
+        # None = network error → don't cache; [] = not found → cache to skip next session
+        if lfm_tags is not None:
             cache[tid]["track_genres"] = lfm_tags
-            # Propagate into live results so the frontend picks them up
-            if tid in _analysis_state["results"]:
+            # Propagate non-empty results into live state so the frontend picks them up
+            if lfm_tags and tid in _analysis_state["results"]:
                 _analysis_state["results"][tid]["track_genres"] = lfm_tags
 
     tasks          = [asyncio.create_task(_lookup(t)) for t in tracks]
@@ -155,9 +157,8 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
     _analysis_state["running"] = False
     log.info("BPM done: %d/%d found, %d errors", len(tracks) - errors, len(tracks), errors)
 
-    # Genre backfill continues — frontend keeps polling on `backfilling` flag
+    # Genre backfill — already marked backfilling=True in start_analyze before response was sent
     if backfill_tasks:
-        _analysis_state["backfilling"] = True
         await asyncio.gather(*backfill_tasks, return_exceptions=True)
         save_cache(cache)
         _analysis_state["backfilling"] = False
@@ -249,12 +250,13 @@ async def tracks(request: Request):
         _track_cache[access_token] = library
 
     # Merge per-track Last.fm genre tags from the audio cache, overriding
-    # the artist-level Spotify genres for any track that has been analysed.
+    # the artist-level Spotify genres for any track that has a non-empty result.
+    # track_genres=[] means Last.fm returned nothing — keep Spotify genres in that case.
     audio_cache = load_cache()
-    if any("track_genres" in audio_cache.get(t["id"], {}) for t in library):
+    if any(audio_cache.get(t["id"], {}).get("track_genres") for t in library):
         library = [
             {**t, "genres": audio_cache[t["id"]]["track_genres"]}
-            if "track_genres" in audio_cache.get(t["id"], {})
+            if audio_cache.get(t["id"], {}).get("track_genres")
             else t
             for t in library
         ]
@@ -301,8 +303,11 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
         len(library), cached_ok, cached_err, len(to_analyze), len(to_genre_backfill),
     )
 
+    # Set backfilling=True BEFORE returning the response so the first poll
+    # doesn't see running=False/backfilling=False and close the poll prematurely.
     _analysis_state.update({
-        "running": bool(to_analyze),
+        "running":    bool(to_analyze),
+        "backfilling": bool(to_genre_backfill),
         "total": len(to_analyze),
         "done": 0,
     })
