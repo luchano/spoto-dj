@@ -41,7 +41,13 @@ app = FastAPI(title="Spoto DJ")
 _sessions: dict[str, dict] = {}
 _track_cache: dict[str, list[dict]] = {}
 _pending_states: set[str] = set()
-_analysis_state: dict = {"running": False, "total": 0, "done": 0, "results": {}}
+_analysis_state: dict = {
+    "running": False,     # BPM lookups in progress
+    "backfilling": False, # Last.fm genre backfill in progress (silent, after BPM done)
+    "total": 0,
+    "done": 0,
+    "results": {},
+}
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -144,15 +150,17 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
             save_cache(cache)
             log.info("Progress: %d/%d (errors: %d)", _analysis_state["done"], len(tracks), errors)
 
-    # BPM analysis done — mark complete so the frontend stops polling
+    # BPM analysis done — mark complete so the frontend stops the progress bar
     save_cache(cache)
     _analysis_state["running"] = False
     log.info("BPM done: %d/%d found, %d errors", len(tracks) - errors, len(tracks), errors)
 
-    # Genre backfill continues silently after BPM is marked done
+    # Genre backfill continues — frontend keeps polling on `backfilling` flag
     if backfill_tasks:
+        _analysis_state["backfilling"] = True
         await asyncio.gather(*backfill_tasks, return_exceptions=True)
         save_cache(cache)
+        _analysis_state["backfilling"] = False
         log.info("Genre backfill complete: %d cached tracks updated", len(to_genre_backfill))
 
 
@@ -233,12 +241,25 @@ async def tracks(request: Request):
     if not access_token:
         raise HTTPException(401, "Not authenticated")
 
-    if access_token in _track_cache:
-        return JSONResponse({"tracks": _track_cache[access_token], "cached": True})
+    cached = access_token in _track_cache
+    if cached:
+        library = _track_cache[access_token]
+    else:
+        library = await build_track_library(access_token)
+        _track_cache[access_token] = library
 
-    library = await build_track_library(access_token)
-    _track_cache[access_token] = library
-    return JSONResponse({"tracks": library, "cached": False})
+    # Merge per-track Last.fm genre tags from the audio cache, overriding
+    # the artist-level Spotify genres for any track that has been analysed.
+    audio_cache = load_cache()
+    if any("track_genres" in audio_cache.get(t["id"], {}) for t in library):
+        library = [
+            {**t, "genres": audio_cache[t["id"]]["track_genres"]}
+            if "track_genres" in audio_cache.get(t["id"], {})
+            else t
+            for t in library
+        ]
+
+    return JSONResponse({"tracks": library, "cached": cached})
 
 
 @app.post("/api/analyze")
@@ -293,16 +314,18 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
         "status": "started",
         "total": len(to_analyze),
         "cached": len(cache),
+        "backfill_count": len(to_genre_backfill),
     })
 
 
 @app.get("/api/analyze/status")
 async def analyze_status():
     return JSONResponse({
-        "running": _analysis_state["running"],
-        "done": _analysis_state["done"],
-        "total": _analysis_state["total"],
-        "results": _analysis_state["results"],
+        "running":    _analysis_state["running"],
+        "backfilling": _analysis_state["backfilling"],
+        "done":       _analysis_state["done"],
+        "total":      _analysis_state["total"],
+        "results":    _analysis_state["results"],
     })
 
 

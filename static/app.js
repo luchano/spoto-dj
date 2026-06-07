@@ -81,7 +81,8 @@ async function startAnalysis() {
   const banner = document.getElementById("analysis-banner");
   banner.style.display = "";
 
-  if (data.total === 0) {
+  if (data.total === 0 && !data.backfill_count) {
+    // Nothing to analyze and no genre backfill — just apply whatever's in cache
     const statusRes = await fetch("/api/analyze/status");
     const status = await statusRes.json();
     applyAnalysisResults(status.results);
@@ -91,7 +92,12 @@ async function startAnalysis() {
     return;
   }
 
-  setBannerMsg(`Buscando metadatos… 0 / ${data.total} canciones`, 0);
+  if (data.total === 0 && data.backfill_count) {
+    // No new BPM lookups but genre backfill running — poll silently until done
+    setBannerMsg(`Actualizando géneros… ${data.backfill_count} canciones`, 0);
+  } else {
+    setBannerMsg(`Buscando metadatos… 0 / ${data.total} canciones`, 0);
+  }
   pollTimer = setInterval(pollAnalysis, 2000);
 }
 
@@ -106,7 +112,7 @@ async function pollAnalysis() {
   const pct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 100;
   setBannerMsg(`Analizando… ${data.done} / ${data.total} canciones`, pct);
 
-  if (!data.running) {
+  if (!data.running && !data.backfilling) {
     clearInterval(pollTimer);
     pollTimer = null;
     setBannerMsg(`Metadatos cargados: ${Object.keys(data.results).length} canciones`, 100);
@@ -114,6 +120,8 @@ async function pollAnalysis() {
     const sel = document.getElementById("key-filter");
     sel.innerHTML = '<option value="">All keys</option>';
     populateKeyFilter();
+  } else if (!data.running && data.backfilling) {
+    setBannerMsg("Actualizando géneros…", 99);
   }
 }
 
