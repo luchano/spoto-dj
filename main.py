@@ -13,14 +13,36 @@ from fastapi.staticfiles import StaticFiles
 
 from analysis import load_cache, save_cache
 from getsongbpm import lookup_track, QUOTA_EXCEEDED as _GETSONGBPM_QUOTA
+from lastfm import lookup_track_tags as _lastfm_tags
 from playlist_engine import (
     create_playlist, delete_playlist, generate as generate_playlist,
-    load_playlists, save_playlists,
+    genre_options, load_playlists, save_playlists,
 )
 from spotify import build_track_library
 
 log = logging.getLogger("spoto")
-logging.basicConfig(level=logging.INFO, format="%(levelname)s  %(name)s  %(message)s")
+
+# ── logging: console + rotating file ─────────────────────────────────────────
+_LOG_FMT = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
+_LOG_DATE = "%Y-%m-%d %H:%M:%S"
+
+from logging.handlers import RotatingFileHandler as _RFH
+
+_root = logging.getLogger()
+_root.setLevel(logging.INFO)
+
+_console = logging.StreamHandler()
+_console.setFormatter(logging.Formatter(_LOG_FMT, datefmt=_LOG_DATE))
+_root.addHandler(_console)
+
+_file_handler = _RFH(
+    Path(__file__).parent / "server.log",
+    maxBytes=10 * 1024 * 1024,  # 10 MB per file
+    backupCount=3,
+    encoding="utf-8",
+)
+_file_handler.setFormatter(logging.Formatter(_LOG_FMT, datefmt=_LOG_DATE))
+_root.addHandler(_file_handler)
 
 load_dotenv()
 
@@ -29,6 +51,7 @@ CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "")
 REDIRECT_URI = os.getenv("SPOTIFY_REDIRECT_URI", "http://localhost:8000/callback")
 SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 GETSONGBPM_API_KEY = os.getenv("GETSONGBPM_API_KEY", "")
+LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "")
 
 SCOPES = "user-library-read playlist-modify-public playlist-modify-private"
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
@@ -39,7 +62,13 @@ app = FastAPI(title="Spoto DJ")
 _sessions: dict[str, dict] = {}
 _track_cache: dict[str, list[dict]] = {}
 _pending_states: set[str] = set()
-_analysis_state: dict = {"running": False, "total": 0, "done": 0, "results": {}}
+_analysis_state: dict = {
+    "running": False,     # BPM lookups in progress
+    "backfilling": False, # Last.fm genre backfill in progress (silent, after BPM done)
+    "total": 0,
+    "done": 0,
+    "results": {},
+}
 
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
@@ -55,23 +84,65 @@ def _get_session(request: Request) -> dict:
     return _sessions.get(sid, {}) if sid else {}
 
 
-async def _run_analysis(tracks: list[dict], cache: dict):
-    log.info("Analysis started: %d tracks via GetSongBPM", len(tracks))
-    # 2 concurrent requests — conservative for free-tier rate limits
-    semaphore = asyncio.Semaphore(2)
+def _primary_artist(track: dict) -> str:
+    """Extract the first artist name from a track dict (handles str or list)."""
+    raw = track.get("artists", "")
+    if isinstance(raw, list):
+        return raw[0].strip() if raw else ""
+    return raw.split(",")[0].strip() if raw else ""
+
+
+async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache: dict):
+    """
+    tracks            — tracks NOT in cache; get BPM (GetSongBPM) + genres (Last.fm)
+    to_genre_backfill — tracks already in cache but missing track_genres; Last.fm only
+    cache             — full audio cache dict (mutated in place)
+    """
+    log.info(
+        "Analysis started: %d new tracks (BPM + genre), %d cached tracks (genre backfill)",
+        len(tracks), len(to_genre_backfill),
+    )
+    bpm_sem = asyncio.Semaphore(2)   # conservative for GetSongBPM free tier
+    lfm_sem = asyncio.Semaphore(5)   # Last.fm allows 5 req/s on free tier
 
     async def _lookup(track: dict):
+        """Full lookup: BPM via GetSongBPM + genres via Last.fm, concurrently."""
+        title  = track.get("title", "")
+        artists = track.get("artists", [])
+        primary = _primary_artist(track)
+        album   = track.get("album", "")
+
         async with httpx.AsyncClient() as client:
-            return await lookup_track(
-                GETSONGBPM_API_KEY,
-                track["id"],
-                track.get("title", ""),
-                track.get("artists", []),
-                client,
-                semaphore,
+            (track_id, bpm_result), lfm_tags = await asyncio.gather(
+                lookup_track(GETSONGBPM_API_KEY, track["id"], title, artists, client, bpm_sem),
+                _lastfm_tags(LASTFM_API_KEY, title, primary, client, lfm_sem, album),
             )
 
-    tasks = [asyncio.create_task(_lookup(t)) for t in tracks]
+        # None = network error → don't cache (retry next session)
+        # []   = not found   → cache as empty so we don't re-query next session
+        if lfm_tags is not None:
+            bpm_result["track_genres"] = lfm_tags
+        return track_id, bpm_result
+
+    async def _genre_only(track: dict):
+        """Last.fm-only lookup for tracks already in cache but missing track_genres."""
+        tid    = track["id"]
+        title  = track.get("title", "")
+        primary = _primary_artist(track)
+        album   = track.get("album", "")
+
+        async with httpx.AsyncClient() as client:
+            lfm_tags = await _lastfm_tags(LASTFM_API_KEY, title, primary, client, lfm_sem, album)
+
+        # None = network error → don't cache; [] = not found → cache to skip next session
+        if lfm_tags is not None:
+            cache[tid]["track_genres"] = lfm_tags
+            # Propagate non-empty results into live state so the frontend picks them up
+            if lfm_tags and tid in _analysis_state["results"]:
+                _analysis_state["results"][tid]["track_genres"] = lfm_tags
+
+    tasks          = [asyncio.create_task(_lookup(t)) for t in tracks]
+    backfill_tasks = [asyncio.create_task(_genre_only(t)) for t in to_genre_backfill]
 
     # Permanent errors worth caching so we don't waste API calls on retries.
     # Transient errors (quota, network, HTTP 5xx) are NOT cached → retried next session.
@@ -104,9 +175,17 @@ async def _run_analysis(tracks: list[dict], cache: dict):
             save_cache(cache)
             log.info("Progress: %d/%d (errors: %d)", _analysis_state["done"], len(tracks), errors)
 
+    # BPM analysis done — mark complete so the frontend stops the progress bar
     save_cache(cache)
     _analysis_state["running"] = False
-    log.info("Done: %d/%d found, %d errors", len(tracks) - errors, len(tracks), errors)
+    log.info("BPM done: %d/%d found, %d errors", len(tracks) - errors, len(tracks), errors)
+
+    # Genre backfill — already marked backfilling=True in start_analyze before response was sent
+    if backfill_tasks:
+        await asyncio.gather(*backfill_tasks, return_exceptions=True)
+        save_cache(cache)
+        _analysis_state["backfilling"] = False
+        log.info("Genre backfill complete: %d cached tracks updated", len(to_genre_backfill))
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -186,12 +265,26 @@ async def tracks(request: Request):
     if not access_token:
         raise HTTPException(401, "Not authenticated")
 
-    if access_token in _track_cache:
-        return JSONResponse({"tracks": _track_cache[access_token], "cached": True})
+    cached = access_token in _track_cache
+    if cached:
+        library = _track_cache[access_token]
+    else:
+        library = await build_track_library(access_token)
+        _track_cache[access_token] = library
 
-    library = await build_track_library(access_token)
-    _track_cache[access_token] = library
-    return JSONResponse({"tracks": library, "cached": False})
+    # Merge per-track Last.fm genre tags from the audio cache as a SEPARATE field
+    # (`track_genres`) so the frontend can show Spotify artist genres and Last.fm
+    # track genres side by side. The Spotify `genres` field is left untouched.
+    audio_cache = load_cache()
+    if any(audio_cache.get(t["id"], {}).get("track_genres") for t in library):
+        library = [
+            {**t, "track_genres": audio_cache[t["id"]]["track_genres"]}
+            if audio_cache.get(t["id"], {}).get("track_genres")
+            else t
+            for t in library
+        ]
+
+    return JSONResponse({"tracks": library, "cached": cached})
 
 
 @app.post("/api/analyze")
@@ -215,38 +308,55 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
     _analysis_state["results"] = {k: v for k, v in cache.items() if "error" not in v}
     to_analyze = [t for t in library if t["id"] not in cache]
 
+    # Tracks in cache but with no Last.fm genre tags → backfill silently alongside
+    # BPM analysis. We re-query empty results too (not just missing ones): the
+    # fallback chain (track → album → artist) now resolves nearly everything, so
+    # previously-empty entries are worth another look.
+    to_genre_backfill: list[dict] = []
+    if LASTFM_API_KEY:
+        to_genre_backfill = [
+            t for t in library
+            if t["id"] in cache
+            and "error" not in cache[t["id"]]
+            and not cache[t["id"]].get("track_genres")
+        ]
+
     cached_ok = sum(1 for v in cache.values() if "error" not in v)
     cached_err = len(cache) - cached_ok
     log.info(
-        "Analyze request: %d total, %d cached ok, %d cached not-found, %d to look up",
-        len(library), cached_ok, cached_err, len(to_analyze),
+        "Analyze request: %d total, %d cached ok, %d cached not-found, "
+        "%d to look up, %d genre backfill",
+        len(library), cached_ok, cached_err, len(to_analyze), len(to_genre_backfill),
     )
 
+    # Set backfilling=True BEFORE returning the response so the first poll
+    # doesn't see running=False/backfilling=False and close the poll prematurely.
     _analysis_state.update({
-        "running": True,
+        "running":    bool(to_analyze),
+        "backfilling": bool(to_genre_backfill),
         "total": len(to_analyze),
         "done": 0,
     })
 
-    if to_analyze:
-        background_tasks.add_task(_run_analysis, to_analyze, cache)
-    else:
-        _analysis_state["running"] = False
+    if to_analyze or to_genre_backfill:
+        background_tasks.add_task(_run_analysis, to_analyze, to_genre_backfill, cache)
 
     return JSONResponse({
         "status": "started",
         "total": len(to_analyze),
         "cached": len(cache),
+        "backfill_count": len(to_genre_backfill),
     })
 
 
 @app.get("/api/analyze/status")
 async def analyze_status():
     return JSONResponse({
-        "running": _analysis_state["running"],
-        "done": _analysis_state["done"],
-        "total": _analysis_state["total"],
-        "results": _analysis_state["results"],
+        "running":    _analysis_state["running"],
+        "backfilling": _analysis_state["backfilling"],
+        "done":       _analysis_state["done"],
+        "total":      _analysis_state["total"],
+        "results":    _analysis_state["results"],
     })
 
 
@@ -271,6 +381,19 @@ async def list_playlists(request: Request):
     ]
     summaries.sort(key=lambda x: x["created_at"], reverse=True)
     return JSONResponse(summaries)
+
+
+@app.get("/api/playlists/genres")
+async def api_genre_options(request: Request):
+    """Genre dropdown options derived from the user's own analysed library."""
+    session = _get_session(request)
+    access_token = session.get("access_token")
+    if not access_token:
+        raise HTTPException(401, "Not authenticated")
+
+    library = _track_cache.get(access_token, [])
+    options = genre_options(library, load_cache()) if library else []
+    return JSONResponse({"genres": options})
 
 
 @app.post("/api/playlists/generate")

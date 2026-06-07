@@ -36,9 +36,11 @@ from playlist_engine import (
     delete_playlist,
     distribute_sections,
     generate,
+    genre_options,
     load_playlists,
     save_playlists,
     score_candidate,
+    tags_to_clusters,
 )
 
 
@@ -370,6 +372,63 @@ class TestClassifyGenre:
 
     def test_mixed_picks_best(self):
         assert classify_genre(["electronic", "deep house", "rap"]) == "electronic"
+
+
+class TestTagsToClusters:
+    def test_separator_variants_normalise(self):
+        # "deep house" / "deep-house" / "deephouse" all collapse to electronic
+        assert tags_to_clusters(["deep house"]) == {"electronic"}
+        assert tags_to_clusters(["deep-house"]) == {"electronic"}
+        assert tags_to_clusters(["deephouse"]) == {"electronic"}
+
+    def test_multi_membership(self):
+        assert tags_to_clusters(["indie pop"]) == {"indie", "pop"}
+        assert tags_to_clusters(["neo-soul"]) == {"hip_hop", "jazz"}
+
+    def test_combines_multiple_tags(self):
+        assert tags_to_clusters(["reggaeton", "techno"]) == {"latin", "electronic"}
+
+    def test_no_substring_false_positives(self):
+        # exact-normalised matching: "dub" must not match "dubstep" and vice-versa
+        assert tags_to_clusters(["dub"]) == {"world"}
+        assert tags_to_clusters(["dubstep"]) == {"electronic"}
+        # "trap" must not be matched by a "rap" rule (both happen to be hip_hop,
+        # but each is matched exactly, not by substring)
+        assert tags_to_clusters(["trap"]) == {"hip_hop"}
+
+    def test_unknown_and_noise(self):
+        assert tags_to_clusters(["xyzzy"]) == set()
+        assert tags_to_clusters(["80s", "shake that thing"]) == set()
+
+    def test_empty(self):
+        assert tags_to_clusters([]) == set()
+
+
+class TestGenreOptions:
+    def test_counts_and_min_threshold(self):
+        lib = [_track(f"t{i}", genres=["house"]) for i in range(10)]
+        lib += [_track("r1", genres=["reggae"])]   # below threshold → hidden
+        cache = {t["id"]: _cache_ok() for t in lib}
+        opts = genre_options(lib, cache, min_tracks=8)
+        values = {o["value"] for o in opts}
+        assert "electronic" in values
+        assert "world" not in values
+        elec = next(o for o in opts if o["value"] == "electronic")
+        assert elec["count"] == 10 and elec["label"]
+
+    def test_combines_spotify_and_lastfm_tags(self):
+        lib = [_track("t1", genres=["pop"])]
+        cache = {"t1": {**_cache_ok(), "track_genres": ["reggaeton"]}}
+        clusters = {o["value"] for o in genre_options(lib, cache, min_tracks=1)}
+        assert "pop" in clusters and "latin" in clusters
+
+    def test_sorted_by_count_desc(self):
+        lib = [_track(f"e{i}", genres=["techno"]) for i in range(5)]
+        lib += [_track(f"l{i}", genres=["cumbia"]) for i in range(9)]
+        cache = {t["id"]: _cache_ok() for t in lib}
+        opts = genre_options(lib, cache, min_tracks=1)
+        counts = [o["count"] for o in opts]
+        assert counts == sorted(counts, reverse=True)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -8,3 +8,9 @@ __pycache__/
 dist/
 build/
 .pytest_cache/
+*.log
+*.log.*
+
+# Local runtime data (per-user state, not source)
+.audio_cache.json
+.playlists.json

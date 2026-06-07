@@ -5,6 +5,7 @@ let sortDir = -1;
 let pollTimer = null;
 let canExport = false;          // true when spotify_user_id is available
 let currentPlaylistId = null;   // id of the playlist shown in detail view
+let genreLabels = {};           // cluster value -> human label (from /api/playlists/genres)
 
 // ─────────────────────────────────────────────────────────────
 // Init & auth
@@ -57,6 +58,7 @@ async function loadTracks() {
     const data = await res.json();
     allTracks = data.tracks;
     populateKeyFilter();
+    populateGenreFilter();
     applyFilters();
     document.getElementById("loading").style.display = "none";
     document.getElementById("library").style.display = "";
@@ -67,31 +69,47 @@ async function loadTracks() {
   }
 }
 
+function setRefreshBtn(disabled, label) {
+  const btn = document.getElementById("refresh-genres-btn");
+  if (!btn) return;
+  btn.disabled = disabled;
+  btn.textContent = label || "Actualizar géneros";
+}
+
 async function startAnalysis() {
+  setRefreshBtn(true, "Actualizando…");
   let data;
   try {
     const res = await fetch("/api/analyze", { method: "POST" });
-    if (!res.ok) { console.warn("analyze endpoint error", res.status); return; }
+    if (!res.ok) { console.warn("analyze endpoint error", res.status); setRefreshBtn(false); return; }
     data = await res.json();
   } catch (e) {
     console.warn("startAnalysis fetch failed", e);
+    setRefreshBtn(false);
     return;
   }
 
   const banner = document.getElementById("analysis-banner");
   banner.style.display = "";
 
-  if (data.total === 0) {
+  if (data.total === 0 && !data.backfill_count) {
+    // Nothing to analyze and no genre backfill — just apply whatever's in cache
     const statusRes = await fetch("/api/analyze/status");
     const status = await statusRes.json();
     applyAnalysisResults(status.results);
     const cached = Object.keys(status.results).length;
     setBannerMsg(cached > 0 ? `${cached} canciones cargadas desde caché` : "Sin canciones para analizar", 100);
     setTimeout(() => { banner.style.display = "none"; }, 4000);
+    setRefreshBtn(false);
     return;
   }
 
-  setBannerMsg(`Buscando metadatos… 0 / ${data.total} canciones`, 0);
+  if (data.total === 0 && data.backfill_count) {
+    // No new BPM lookups but genre backfill running — poll silently until done
+    setBannerMsg(`Actualizando géneros… ${data.backfill_count} canciones`, 0);
+  } else {
+    setBannerMsg(`Buscando metadatos… 0 / ${data.total} canciones`, 0);
+  }
   pollTimer = setInterval(pollAnalysis, 2000);
 }
 
@@ -106,14 +124,18 @@ async function pollAnalysis() {
   const pct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 100;
   setBannerMsg(`Analizando… ${data.done} / ${data.total} canciones`, pct);
 
-  if (!data.running) {
+  if (!data.running && !data.backfilling) {
     clearInterval(pollTimer);
     pollTimer = null;
+    setRefreshBtn(false);
     setBannerMsg(`Metadatos cargados: ${Object.keys(data.results).length} canciones`, 100);
     setTimeout(() => { document.getElementById("analysis-banner").style.display = "none"; }, 3000);
     const sel = document.getElementById("key-filter");
     sel.innerHTML = '<option value="">All keys</option>';
     populateKeyFilter();
+    populateGenreFilter();
+  } else if (!data.running && data.backfilling) {
+    setBannerMsg("Actualizando géneros…", 99);
   }
 }
 
@@ -122,8 +144,15 @@ function applyAnalysisResults(results) {
   let changed = false;
   allTracks.forEach(t => {
     const r = results[t.id];
-    if (r && !r.error && t.bpm === 0) {
+    if (!r || r.error) return;
+    if (t.bpm === 0) {
       t.bpm = r.bpm; t.key = r.key; t.camelot = r.camelot; t.energy = r.energy;
+      changed = true;
+    }
+    // Keep Last.fm track tags in a separate field so Spotify artist genres and
+    // Last.fm track genres can be displayed side by side.
+    if (r.track_genres && r.track_genres.length) {
+      t.track_genres = r.track_genres;
       changed = true;
     }
   });
@@ -133,6 +162,29 @@ function applyAnalysisResults(results) {
 function setBannerMsg(msg, pct) {
   document.getElementById("analysis-msg").textContent = msg;
   document.getElementById("analysis-progress").style.width = `${pct}%`;
+}
+
+async function populateGenreFilter() {
+  const sel = document.getElementById("pl-genre");
+  if (!sel) return;
+  let genres;
+  try {
+    const res = await fetch("/api/playlists/genres");
+    if (!res.ok) return;
+    genres = (await res.json()).genres || [];
+  } catch (e) { return; }
+
+  const current = sel.value;
+  sel.innerHTML = '<option value="">Todos los géneros</option>';
+  genres.forEach(g => {
+    genreLabels[g.value] = g.label;
+    const opt = document.createElement("option");
+    opt.value = g.value;
+    opt.textContent = `${g.label} (${g.count})`;
+    sel.appendChild(opt);
+  });
+  // Restore prior selection if it still exists
+  if (current && genres.some(g => g.value === current)) sel.value = current;
 }
 
 function populateKeyFilter() {
@@ -154,7 +206,7 @@ function applyFilters() {
 
   filtered = allTracks.filter(t => {
     if (q) {
-      const hay = `${t.title} ${t.artists} ${t.genres.join(" ")} ${t.album}`.toLowerCase();
+      const hay = `${t.title} ${t.artists} ${t.genres.join(" ")} ${(t.track_genres || []).join(" ")} ${t.album}`.toLowerCase();
       if (!hay.includes(q)) return false;
     }
     if (t.bpm < bpmMin || t.bpm > bpmMax) return false;
@@ -197,6 +249,7 @@ function renderTable() {
   document.getElementById("track-count").textContent = `${filtered.length} of ${allTracks.length} tracks`;
   tbody.innerHTML = filtered.map(t => {
     const genres = t.genres.map(g => `<span class="genre-pill">${g}</span>`).join("");
+    const trackGenres = (t.track_genres || []).map(g => `<span class="genre-pill">${g}</span>`).join("");
     const img = t.image_url
       ? `<img class="cover" src="${t.image_url}" alt="" loading="lazy" />`
       : `<div class="cover" style="background:var(--bg3)"></div>`;
@@ -208,6 +261,7 @@ function renderTable() {
       <td style="max-width:200px">${link}</td>
       <td style="max-width:160px">${esc(t.artists)}</td>
       <td style="max-width:180px">${genres || '<span class="muted">—</span>'}</td>
+      <td style="max-width:180px">${trackGenres || '<span class="muted">—</span>'}</td>
       <td><strong>${t.bpm || "—"}</strong></td>
       <td>${t.camelot && t.camelot !== "?" ? camelotBadge(t.camelot) : '<span class="muted">—</span>'}</td>
       <td style="color:var(--muted);font-size:12px">${t.key && t.key !== "?" ? t.key : "—"}</td>
@@ -227,7 +281,7 @@ function esc(str) {
 }
 
 function exportCSV() {
-  const cols = ["title","artists","genres","bpm","camelot","key","energy","danceability","valence","loudness","year","duration","popularity","album","added_at","time_signature","acousticness","instrumentalness"];
+  const cols = ["title","artists","genres","track_genres","bpm","camelot","key","energy","danceability","valence","loudness","year","duration","popularity","album","added_at","time_signature","acousticness","instrumentalness"];
   const header = cols.join(",");
   const rows = filtered.map(t =>
     cols.map(c => {
@@ -364,7 +418,7 @@ async function openPLDetail(pid) {
     <span>${p.track_count} tracks</span>
     <span>${fmtDuration(p.total_duration_ms)}</span>
     ${bpmLabel ? `<span>${bpmLabel}</span>` : ""}
-    ${params.genre_filter ? `<span>${params.genre_filter}</span>` : ""}
+    ${params.genre_filter ? `<span>${esc(genreLabels[params.genre_filter] || params.genre_filter)}</span>` : ""}
   `;
 
   const warningsEl = document.getElementById("pl-detail-warnings");
