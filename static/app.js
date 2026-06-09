@@ -302,6 +302,35 @@ function exportCSV() {
 // Playlists tab
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * Show a live preview of the auto-generated set name below the prefix field.
+ * Genre is omitted here (it depends on which tracks get selected); the server
+ * fills it in with the actual dominant genre when the set is generated.
+ */
+function updateNamePreview() {
+  const preview = document.getElementById("pl-name-preview");
+  if (!preview) return;
+
+  const prefix  = document.getElementById("pl-name").value.trim();
+  const dur     = document.getElementById("pl-duration").value + "min";
+  const bpmMin  = document.getElementById("pl-bpm-min").value;
+  const bpmMax  = document.getElementById("pl-bpm-max").value;
+
+  const now    = new Date();
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const day    = String(now.getDate()).padStart(2, "0");
+  const date   = `${months[now.getMonth()]} ${day}`;
+
+  const parts = ["[género]", dur];
+  if (bpmMin && bpmMax && parseInt(bpmMin) < parseInt(bpmMax)) {
+    parts.push(`${bpmMin}–${bpmMax} BPM`);
+  }
+  parts.push(date);
+
+  const autoName = parts.join(" · ");
+  preview.textContent = "→ " + (prefix ? `${prefix} · ${autoName}` : autoName);
+}
+
 async function generatePlaylist() {
   const btn = document.getElementById("pl-generate-btn");
   const status = document.getElementById("pl-gen-status");

@@ -101,7 +101,7 @@
               Duration
               <div class="slider-row">
                 <input type="range" id="pl-duration" min="40" max="180" step="5" value="60"
-                       oninput="document.getElementById('pl-duration-val').textContent=this.value+'min'" />
+                       oninput="document.getElementById('pl-duration-val').textContent=this.value+'min'; updateNamePreview()" />
                 <span id="pl-duration-val">60min</span>
               </div>
             </label>
@@ -109,9 +109,9 @@
             <label>
               BPM range
               <div class="bpm-range-row">
-                <input type="number" id="pl-bpm-min" placeholder="min (e.g. 120)" min="40" max="220" />
+                <input type="number" id="pl-bpm-min" placeholder="min (e.g. 120)" min="40" max="220" oninput="updateNamePreview()" />
                 <span class="bpm-range-sep">–</span>
-                <input type="number" id="pl-bpm-max" placeholder="max (e.g. 135)" min="40" max="220" />
+                <input type="number" id="pl-bpm-max" placeholder="max (e.g. 135)" min="40" max="220" oninput="updateNamePreview()" />
               </div>
               <span class="bpm-hint muted">Hip Hop 85–100 · House 120–130 · Techno 130–145</span>
             </label>
@@ -124,8 +124,10 @@
             </label>
 
             <label>
-              Set name <small>(optional)</small>
-              <input type="text" id="pl-name" placeholder="e.g. Saturday night set" />
+              Prefijo <small>(opcional)</small>
+              <input type="text" id="pl-name" placeholder="Closing set, B2B, Room 2…"
+                     oninput="updateNamePreview()" />
+              <span id="pl-name-preview" class="bpm-hint muted"></span>
             </label>
           </div>
 
