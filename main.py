@@ -11,7 +11,7 @@ from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
-from analysis import load_cache, save_cache
+from analysis import load_cache, save_cache, analyze_track as _yt_analyze
 from getsongbpm import lookup_track, QUOTA_EXCEEDED as _GETSONGBPM_QUOTA
 from lastfm import lookup_track_tags as _lastfm_tags
 from playlist_engine import (
@@ -73,6 +73,10 @@ _analysis_state: dict = {
 static_dir = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
+# Error prefixes that are permanent (not transient) — safe to cache so we don't
+# waste API calls retrying them. Defined at module level so _lookup() can use it.
+_PERMANENT_ERRORS = ("not found", "incomplete data")
+
 
 def _set_session(response, session_id: str, data: dict):
     _sessions[session_id] = data
@@ -104,10 +108,11 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
     )
     bpm_sem = asyncio.Semaphore(2)   # conservative for GetSongBPM free tier
     lfm_sem = asyncio.Semaphore(5)   # Last.fm allows 5 req/s on free tier
+    yt_sem  = asyncio.Semaphore(3)   # YouTube downloads: 3 concurrent max
 
     async def _lookup(track: dict):
-        """Full lookup: BPM via GetSongBPM + genres via Last.fm, concurrently."""
-        title  = track.get("title", "")
+        """Full lookup: BPM via GetSongBPM (+ YouTube fallback) + genres via Last.fm."""
+        title   = track.get("title", "")
         artists = track.get("artists", [])
         primary = _primary_artist(track)
         album   = track.get("album", "")
@@ -117,6 +122,18 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
                 lookup_track(GETSONGBPM_API_KEY, track["id"], title, artists, client, bpm_sem),
                 _lastfm_tags(LASTFM_API_KEY, title, primary, client, lfm_sem, album),
             )
+
+        # If GetSongBPM couldn't find the track, fall back to YouTube + librosa analysis
+        if "error" in bpm_result and any(bpm_result["error"].startswith(p) for p in _PERMANENT_ERRORS):
+            log.info("GetSongBPM miss for '%s' — trying YouTube/librosa fallback", title)
+            _, yt_result = await _yt_analyze(track["id"], title, artists, "", yt_sem)
+            if "error" not in yt_result:
+                yt_result["source"] = "youtube"
+                bpm_result = yt_result
+                log.info("YouTube analysis OK for '%s': bpm=%s key=%s camelot=%s",
+                         title, yt_result.get("bpm"), yt_result.get("key"), yt_result.get("camelot"))
+            else:
+                log.warning("YouTube fallback also failed for '%s': %s", title, yt_result.get("error"))
 
         # None = network error → don't cache (retry next session)
         # []   = not found   → cache as empty so we don't re-query next session
@@ -144,10 +161,6 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
     tasks          = [asyncio.create_task(_lookup(t)) for t in tracks]
     backfill_tasks = [asyncio.create_task(_genre_only(t)) for t in to_genre_backfill]
 
-    # Permanent errors worth caching so we don't waste API calls on retries.
-    # Transient errors (quota, network, HTTP 5xx) are NOT cached → retried next session.
-    _PERMANENT = ("not found", "incomplete data")
-
     errors = 0
     for coro in asyncio.as_completed(tasks):
         track_id, result = await coro
@@ -165,7 +178,7 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
             errors += 1
             msg = result["error"]
             log.warning("Lookup failed %s: %s", track_id, msg)
-            if any(msg.startswith(p) for p in _PERMANENT):
+            if any(msg.startswith(p) for p in _PERMANENT_ERRORS):
                 cache[track_id] = result   # cache so we skip next time
         else:
             cache[track_id] = result
