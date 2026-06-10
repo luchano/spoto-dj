@@ -322,8 +322,13 @@ function updateNamePreview() {
   const date   = `${months[now.getMonth()]} ${day}`;
 
   const parts = ["[género]", dur];
-  if (bpmMin && bpmMax && parseInt(bpmMin) < parseInt(bpmMax)) {
-    parts.push(`${bpmMin}–${bpmMax} BPM`);
+  const bpmMinP = parseInt(bpmMin), bpmMaxP = parseInt(bpmMax);
+  if (!isNaN(bpmMinP) && !isNaN(bpmMaxP) && bpmMinP < bpmMaxP) {
+    parts.push(`${bpmMinP}–${bpmMaxP} BPM`);
+  } else if (!isNaN(bpmMinP)) {
+    parts.push(`${bpmMinP}+ BPM`);
+  } else if (!isNaN(bpmMaxP)) {
+    parts.push(`up to ${bpmMaxP} BPM`);
   }
   parts.push(date);
 
@@ -337,20 +342,27 @@ async function generatePlaylist() {
   btn.disabled = true;
   status.textContent = "Generating…";
 
-  const bpmMin = parseInt(document.getElementById("pl-bpm-min").value);
-  const bpmMax = parseInt(document.getElementById("pl-bpm-max").value);
+  const bpmMinRaw = parseInt(document.getElementById("pl-bpm-min").value);
+  const bpmMaxRaw = parseInt(document.getElementById("pl-bpm-max").value);
+  const bpmMin = isNaN(bpmMinRaw) ? null : bpmMinRaw;
+  const bpmMax = isNaN(bpmMaxRaw) ? null : bpmMaxRaw;
 
-  if (bpmMin && bpmMax && bpmMin >= bpmMax) {
+  if (bpmMin !== null && bpmMax !== null && bpmMin >= bpmMax) {
     status.textContent = "BPM min must be less than max.";
     btn.disabled = false;
     return;
+  }
+
+  let bpmRange = null;
+  if (bpmMin !== null || bpmMax !== null) {
+    bpmRange = [bpmMin !== null ? bpmMin : 0, bpmMax !== null ? bpmMax : 9999];
   }
 
   const body = {
     duration_min: parseInt(document.getElementById("pl-duration").value),
     genre_filter: document.getElementById("pl-genre").value || null,
     name:         document.getElementById("pl-name").value.trim() || null,
-    bpm_range:    (bpmMin && bpmMax) ? [bpmMin, bpmMax] : null,
+    bpm_range:    bpmRange,
   };
 
   try {

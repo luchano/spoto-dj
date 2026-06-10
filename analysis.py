@@ -81,49 +81,50 @@ def _analyze_file(path: str) -> dict:
     }
 
 
-def _download_from_youtube(title: str, artists: str) -> Optional[str]:
-    """Search YouTube for 'artists - title', download ~30s of audio to a temp MP3."""
+def _download_audio(title: str, artists: str) -> Optional[str]:
+    """
+    Search for 'artists - title' audio and download to a temp MP3.
+
+    Strategy (tried in order):
+      1. SoundCloud — fast, no SABR/403 issues
+      2. YouTube    — fallback (affected by SABR on some videos but still works for many)
+    """
     import yt_dlp
 
-    tmp_base = tempfile.mktemp()
-    out_path = f"{tmp_base}.mp3"
     query = f"{artists} - {title}"
+    sources = [f"scsearch1:{query}", f"ytsearch1:{query}"]
 
-    ydl_opts = {
-        "format": "bestaudio[abr<=96]/bestaudio/best",
-        "outtmpl": f"{tmp_base}.%(ext)s",
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "64",
-        }],
-        "ffmpeg_location": _FFMPEG_DIR,
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 20,
-        # Use the web client to avoid 403s from DASH streams
-        "extractor_args": {"youtube": {"player_client": ["web"]}},
-        "http_headers": {
-            "User-Agent": (
-                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-        },
-    }
+    for search_url in sources:
+        tmp_base = tempfile.mktemp()
+        out_path = f"{tmp_base}.mp3"
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([f"ytsearch1:{query}"])
-        if Path(out_path).exists():
-            return out_path
-    except Exception:
-        pass
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": f"{tmp_base}.%(ext)s",
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "64",
+            }],
+            "ffmpeg_location": _FFMPEG_DIR,
+            "noplaylist": True,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 20,
+        }
 
-    # Clean up any partial files yt-dlp may have left
-    for leftover in Path(tempfile.gettempdir()).glob(f"{Path(tmp_base).name}*"):
-        leftover.unlink(missing_ok=True)
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([search_url])
+            if Path(out_path).exists():
+                return out_path
+        except Exception:
+            pass
+
+        # Clean up any partial files yt-dlp may have left
+        for leftover in Path(tempfile.gettempdir()).glob(f"{Path(tmp_base).name}*"):
+            leftover.unlink(missing_ok=True)
+
     return None
 
 
@@ -150,10 +151,10 @@ async def analyze_track(
                     tmp_path = f.name
             else:
                 tmp_path = await loop.run_in_executor(
-                    None, _download_from_youtube, title, artists
+                    None, _download_audio, title, artists
                 )
                 if not tmp_path:
-                    return track_id, {"error": f"YouTube download failed for '{title}'"}
+                    return track_id, {"error": f"audio download failed for '{title}'"}
 
             result = await loop.run_in_executor(None, _analyze_file, tmp_path)
             return track_id, result
