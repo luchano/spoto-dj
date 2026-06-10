@@ -623,6 +623,46 @@ class TestGenerate:
         assert r["track_count"] > 0
         assert not any("BPM" in w for w in r.get("warnings", []))
 
+    def test_bpm_min_only_always_enforced(self):
+        """bpm_range with only a minimum (max=9999) must exclude sub-120 tracks
+        even when fewer than 8 tracks qualify — the 'too few tracks' fallback
+        must not silently drop the filter and return out-of-range tracks."""
+        # Build a small library where only 3 tracks are >= 120 BPM.
+        low_tracks  = [_track(tid=f"lo{i}", title=f"Low {i}", bpm=90 + i,
+                               duration_ms=240_000) for i in range(10)]
+        high_tracks = [_track(tid=f"hi{i}", title=f"High {i}", bpm=125 + i,
+                               duration_ms=240_000) for i in range(3)]
+        library = low_tracks + high_tracks
+        cache   = {t["id"]: _cache_ok(t["bpm"], t["camelot"], t["energy"]) for t in library}
+
+        r = generate(library, cache, duration_min=20, bpm_range=(120, 9999))
+
+        out_of_range = [t for t in r["tracks"] if t["bpm"] < 120]
+        assert out_of_range == [], (
+            f"BPM filter (min=120) was ignored: got tracks with BPM "
+            f"{[t['bpm'] for t in out_of_range]}"
+        )
+
+    def test_bpm_min_only_with_genre_always_enforced(self):
+        """Reproduces the reported bug: genre=electronica + bpm_min=120 returned
+        sub-120 tracks. The BPM floor must hold even when the genre-filtered pool
+        has fewer than 8 qualifying tracks."""
+        low  = [_track(tid=f"elo{i}", bpm=90 + i, duration_ms=240_000,
+                        genres=["electronica"]) for i in range(8)]
+        high = [_track(tid=f"ehi{i}", bpm=122 + i, duration_ms=240_000,
+                        genres=["electronica"]) for i in range(4)]
+        library = low + high
+        cache   = {t["id"]: _cache_ok(t["bpm"], t["camelot"], t["energy"]) for t in library}
+
+        r = generate(library, cache, duration_min=20,
+                     genre_filter="electronica", bpm_range=(120, 9999))
+
+        out_of_range = [t for t in r["tracks"] if t["bpm"] < 120]
+        assert out_of_range == [], (
+            f"BPM filter ignored with genre filter active: got BPMs "
+            f"{[t['bpm'] for t in out_of_range]}"
+        )
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Persistence

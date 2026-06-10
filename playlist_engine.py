@@ -590,14 +590,19 @@ def generate(
     if bpm_range:
         lo, hi   = bpm_range
         bpm_pool = [t for t in pool if lo <= t["bpm"] <= hi]
-        if len(bpm_pool) >= 8:
-            pool = bpm_pool
-        else:
+        if len(bpm_pool) == 0:
             warnings.append(
-                f"Only {len(bpm_pool)} tracks in BPM {bpm_range[0]}–{bpm_range[1]}. "
+                f"No tracks found in BPM {bpm_range[0]}–{bpm_range[1]}. "
                 "Ignoring BPM filter."
             )
             bpm_range = None   # don't clamp section BPM targets either
+        else:
+            if len(bpm_pool) < 8:
+                warnings.append(
+                    f"Solo {len(bpm_pool)} canciones en BPM {bpm_range[0]}–{bpm_range[1]}; "
+                    "el set será más corto que la duración pedida."
+                )
+            pool = bpm_pool
 
     # ── Set-wide parameters ──────────────────────────────────────────────────
     n_tracks = max(5, round(duration_min / 3.75))
