@@ -73,9 +73,11 @@ class TestBuildZotifyCommand:
         (rate-limit exposure, zotify issue #209) — they must be off."""
         cmd = ea.build_zotify_command(TRACK_URL)
         for flag in ("--md-save-genres", "--md-disc-track-totals",
-                     "--download-lyrics", "--lyrics-to-file",
-                     "--lyrics-to-metadata", "--album-art-jpg-file"):
+                     "--lyrics-to-file", "--lyrics-to-metadata",
+                     "--md-save-lyrics", "--album-art-jpg-file"):
             assert cmd[cmd.index(flag) + 1] == "False", flag
+        # the deprecated --download-lyrics flag must NOT be present
+        assert "--download-lyrics" not in cmd
 
     def test_rate_limiter_passed_through(self):
         cmd = ea.build_zotify_command(TRACK_URL)

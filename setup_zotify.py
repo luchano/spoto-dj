@@ -40,6 +40,28 @@ except ImportError:
 _orig_set_listen_all = OAuth.set_listen_all
 OAuth.set_listen_all = lambda self, listen_all=True: _orig_set_listen_all(self, False)
 
+# zotify's login retry loop (boot()) reruns the whole OAuth flow when a login
+# attempt fails — e.g. a transient ECONNREFUSED from Spotify's access point —
+# but it never releases the callback server socket from the previous attempt,
+# so the retry dies with "Address already in use" on port 4381. Two guards:
+#   1. allow_reuse_address so a socket in TIME_WAIT doesn't block a rebind.
+#   2. close the callback server after every flow() so the port is free for the
+#      next attempt.
+OAuth.CallbackServer.allow_reuse_address = True
+
+_orig_flow = OAuth.flow
+def _flow_then_release_port(self):
+    try:
+        return _orig_flow(self)
+    finally:
+        server = getattr(self, "_OAuth__server", None)
+        if server is not None:
+            try:
+                server.server_close()
+            except Exception:
+                pass
+OAuth.flow = _flow_then_release_port
+
 AUDIO_DIR = Path(__file__).parent / ".audio_files"
 AUDIO_DIR.mkdir(exist_ok=True)
 
@@ -56,12 +78,15 @@ if __name__ == "__main__":
         "--codec", "copy",
         "--root-path", str(AUDIO_DIR),
         "--output-single", "{id}",
-        "--download-lyrics", "False",
+        "--lyrics-to-file", "False",
+        "--lyrics-to-metadata", "False",
+        "--md-save-lyrics", "False",
         "--album-art-jpg-file", "False",
         "--md-save-genres", "False",
         "--md-disc-track-totals", "False",
         "--disable-song-archive", "True",
         "--disable-directory-archives", "True",
+        "--retry-attempts", "4",   # transient AP refusals self-heal now
         TEST_TRACK,
     ]
     from zotify.__main__ import main

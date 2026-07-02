@@ -252,9 +252,9 @@ def build_zotify_command(spotify_url: str) -> list:
         "--codec", "copy",                        # keep native stream, no ffmpeg
         "--root-path", str(AUDIO_DIR),
         "--output-single", "{id}",                # → AUDIO_DIR/<track_id>.ogg
-        "--download-lyrics", "False",
         "--lyrics-to-file", "False",
         "--lyrics-to-metadata", "False",
+        "--md-save-lyrics", "False",
         "--album-art-jpg-file", "False",
         "--md-save-genres", "False",              # extra API call per track — skip
         "--md-disc-track-totals", "False",        # extra API call per track — skip
