@@ -210,8 +210,12 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
             cache[track_id] = result
             _analysis_state["results"][track_id] = result
         _analysis_state["done"] += 1
-        if _analysis_state["done"] % 50 == 0:
-            save_cache(cache)
+        # Persist after every track: the local pipeline is slow and often
+        # interrupted (server restart), so a coarse checkpoint would lose all
+        # in-flight work. The cache write is atomic and cheap (ms) next to the
+        # seconds-per-track download+analysis.
+        save_cache(cache)
+        if _analysis_state["done"] % 25 == 0:
             log.info("Progress: %d/%d (errors: %d)", _analysis_state["done"], len(tracks), errors)
 
     # BPM analysis done — mark complete so the frontend stops the progress bar
