@@ -410,12 +410,34 @@ def _danceability_score(raw: float) -> int:
     return max(0, min(100, round(score)))
 
 
+def _resolve_tempo_octave(rhythm_bpm: float, percival_bpm: float) -> float:
+    """
+    Correct octave (half/double-tempo) errors in beat tracking.
+
+    RhythmExtractor2013 gives an accurate beat grid but on slow, sparse,
+    reverb-heavy material (e.g. instrumental guitar) it often locks onto the
+    subdivision and reports double the real tempo. We cross-check against a
+    second, independent estimator (PercivalBpmEstimator): when the two disagree
+    by ~2x it's an octave ambiguity, and we fold the primary onto the shared
+    octave. When they agree (the overwhelming common case) the primary is kept
+    untouched.
+    """
+    if percival_bpm <= 0:
+        return rhythm_bpm
+    if 1.85 <= rhythm_bpm / percival_bpm <= 2.15:      # primary doubled the tempo
+        return rhythm_bpm / 2.0
+    if 1.85 <= percival_bpm / rhythm_bpm <= 2.15:      # primary halved the tempo
+        return rhythm_bpm * 2.0
+    return rhythm_bpm
+
+
 def analyze_audio(audio_path: Path) -> dict:
     """
     Analyze audio with essentia. Returns
     {bpm, key, camelot, energy, danceability, loudness}.
 
-    - bpm     — RhythmExtractor2013 (multifeature)
+    - bpm     — RhythmExtractor2013 (multifeature), octave-corrected against
+                PercivalBpmEstimator to fix half/double-tempo errors
     - key     — HPCP-based KeyExtractor → musical key + Camelot
     - loudness— integrated LUFS (EBUR128); matches Spotify's `loudness` dB field
     - energy  — 0–100 derived from loudness (recalibrated, non-saturating)
@@ -428,9 +450,20 @@ def analyze_audio(audio_path: Path) -> dict:
 
     audio = es.MonoLoader(filename=str(audio_path), sampleRate=44100)()
 
-    # BPM — multifeature method handles tempo changes and syncopation better
-    bpm, _, _, _, _ = es.RhythmExtractor2013(method="multifeature")(audio)
-    bpm = round(float(bpm), 1)
+    # BPM — multifeature method handles tempo changes and syncopation better,
+    # then cross-check a second estimator to catch octave (half/double) errors.
+    rhythm_bpm, _, _, _, _ = es.RhythmExtractor2013(method="multifeature")(audio)
+    rhythm_bpm = float(rhythm_bpm)
+    try:
+        percival_bpm = float(es.PercivalBpmEstimator()(audio))
+    except Exception as e:
+        log.warning("PercivalBpmEstimator failed for %s: %s", audio_path, e)
+        percival_bpm = 0.0
+    corrected = _resolve_tempo_octave(rhythm_bpm, percival_bpm)
+    if abs(corrected - rhythm_bpm) > 0.1:
+        log.info("Octave-corrected BPM for %s: %.1f → %.1f (percival=%.1f)",
+                 audio_path.name, rhythm_bpm, corrected, percival_bpm)
+    bpm = round(corrected, 1)
 
     # Key
     key, scale, _ = es.KeyExtractor()(audio)

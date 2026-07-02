@@ -255,6 +255,27 @@ class TestIntegratedLufsRobustness:
         assert ea._integrated_lufs([0.1], es) == -12.3
 
 
+class TestResolveTempoOctave:
+    def test_agreement_keeps_primary(self):
+        # both estimators agree → no correction
+        assert ea._resolve_tempo_octave(128.0, 128.4) == 128.0
+        assert ea._resolve_tempo_octave(89.0, 89.1) == 89.0
+
+    def test_primary_doubled_is_halved(self):
+        # the Mi Amor case: Rhythm=155.6, Percival=78.9 → 77.8
+        assert ea._resolve_tempo_octave(155.6, 78.9) == 155.6 / 2
+
+    def test_primary_halved_is_doubled(self):
+        assert ea._resolve_tempo_octave(80.0, 160.0) == 160.0
+
+    def test_no_percival_keeps_primary(self):
+        assert ea._resolve_tempo_octave(155.6, 0.0) == 155.6
+
+    def test_non_2x_disagreement_keeps_primary(self):
+        # a 1.5x disagreement is not a clean octave → trust primary
+        assert ea._resolve_tempo_octave(150.0, 100.0) == 150.0
+
+
 class TestDanceabilityScore:
     def test_monotonic_and_clamped(self):
         vals = [ea._danceability_score(x) for x in (0.0, 0.8, 1.5, 2.3, 3.0)]
