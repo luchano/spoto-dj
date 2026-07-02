@@ -351,11 +351,75 @@ def download_track(spotify_url: str, track_id: str) -> Optional[Path]:
 # Audio analysis
 # ─────────────────────────────────────────────────────────────────────────────
 
+_LUFS_FLOOR = -70.0  # EBUR128's own silence floor; also our NaN/Inf fallback
+
+
+def _integrated_lufs(mono, es) -> float:
+    """
+    Integrated loudness (LUFS) via EBUR128, the broadcast-standard perceptual
+    loudness measure — the closest match to Spotify's `loudness` dB field.
+    EBUR128 wants a stereo signal; we duplicate the mono channel. Falls back to
+    DynamicComplexity's dB estimate, then to an RMS-derived dB, so it never
+    throws. Always returns a finite value (NaN/Inf → the -70 floor), because
+    downstream round()/int() would otherwise raise on a non-finite input.
+    """
+    import math
+    import numpy as np
+
+    def _finite(x):
+        x = float(x)
+        return x if math.isfinite(x) else _LUFS_FLOOR
+
+    try:
+        stereo = np.stack([mono, mono], axis=1)
+        return _finite(es.LoudnessEBUR128()(stereo)[2])   # index 2 = integratedLoudness
+    except Exception:
+        pass
+    try:
+        _, loud_db = es.DynamicComplexity()(mono)
+        return _finite(loud_db)
+    except Exception:
+        pass
+    # Last resort: RMS → dBFS
+    rms = float(es.RMS()(mono))
+    return 20.0 * math.log10(rms) if rms > 1e-9 else _LUFS_FLOOR
+
+
+def _energy_from_lufs(lufs: float) -> int:
+    """
+    Map perceptual loudness (LUFS) to a 0–100 energy score.
+
+    Replaces the old `RMS * 450` which saturated at 100 for almost any loud,
+    modern master. Real tracks measure roughly -18…-8 LUFS; we map the wider
+    [-30, -6] window to [0, 100] so nothing pins to 100 short of a brickwalled
+    master, and quiet material spreads across the low end.
+    """
+    score = (lufs + 30.0) / 24.0 * 100.0
+    return max(0, min(100, round(score)))
+
+
+def _danceability_score(raw: float) -> int:
+    """
+    Map essentia's DFA danceability (theoretical 0–~3, but real music clusters
+    ~0.8–2.3) onto 0–100. We scale against that empirical window rather than the
+    theoretical ceiling of 3.0 — dividing by 3.0 compresses everything into a
+    dull ~40–60 band with no discriminating power.
+    """
+    lo, hi = 0.8, 2.3
+    score = (raw - lo) / (hi - lo) * 100.0
+    return max(0, min(100, round(score)))
+
+
 def analyze_audio(audio_path: Path) -> dict:
     """
-    Analyze audio with essentia. Returns {bpm, key, camelot, energy}.
-    Uses RhythmExtractor2013 for BPM (more accurate than librosa on electronic music)
-    and HPCP-based KeyExtractor for key detection.
+    Analyze audio with essentia. Returns
+    {bpm, key, camelot, energy, danceability, loudness}.
+
+    - bpm     — RhythmExtractor2013 (multifeature)
+    - key     — HPCP-based KeyExtractor → musical key + Camelot
+    - loudness— integrated LUFS (EBUR128); matches Spotify's `loudness` dB field
+    - energy  — 0–100 derived from loudness (recalibrated, non-saturating)
+    - danceability — essentia Danceability (0–~3) rescaled to 0–100
     """
     try:
         import essentia.standard as es  # type: ignore
@@ -372,15 +436,26 @@ def analyze_audio(audio_path: Path) -> dict:
     key, scale, _ = es.KeyExtractor()(audio)
     camelot = _key_to_camelot(key, scale)
 
-    # Energy — RMS normalized to 0-100 (same scale as existing cache)
-    rms = float(es.RMS()(audio))
-    energy = min(100, round(rms * 450))
+    # Loudness (LUFS) → energy score
+    lufs = _integrated_lufs(audio, es)
+    loudness = round(max(-60.0, min(0.0, lufs)), 1)
+    energy = _energy_from_lufs(lufs)
+
+    # Danceability — essentia returns ~0..3 (higher = more danceable)
+    try:
+        raw_dance, _ = es.Danceability()(audio)
+        danceability = _danceability_score(float(raw_dance))
+    except Exception as e:
+        log.warning("Danceability failed for %s: %s", audio_path, e)
+        danceability = 0
 
     return {
         "bpm": bpm,
         "key": f"{key} {'maj' if scale == 'major' else 'min'}",
         "camelot": camelot,
         "energy": energy,
+        "danceability": danceability,
+        "loudness": loudness,
     }
 
 

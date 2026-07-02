@@ -207,6 +207,89 @@ class TestCleanGenreLabels:
         assert "electronic" in tags_to_clusters(ea._clean_genre_labels(["Electronic---Glitch"]))
 
 
+class TestEnergyFromLufs:
+    def test_monotonic(self):
+        vals = [ea._energy_from_lufs(l) for l in (-40, -30, -20, -14, -10, -6, 0)]
+        assert vals == sorted(vals), vals
+
+    def test_clamped_0_100(self):
+        assert ea._energy_from_lufs(-100) == 0
+        assert ea._energy_from_lufs(10) == 100
+
+    def test_realistic_tracks_do_not_saturate(self):
+        """The whole point of the recalibration: a normal loud master
+        (~-10 LUFS) must land well below 100, unlike the old RMS*450."""
+        assert ea._energy_from_lufs(-10) < 95
+        assert ea._energy_from_lufs(-14) < ea._energy_from_lufs(-8)
+
+    def test_silence_is_zero(self):
+        assert ea._energy_from_lufs(-70) == 0
+
+
+class TestIntegratedLufsRobustness:
+    """A non-finite LUFS would crash the energy path (round(nan) → ValueError),
+    so _integrated_lufs must always return a finite number."""
+
+    class _FakeES:
+        def __init__(self, ebur_val):
+            self._ebur_val = ebur_val
+        def LoudnessEBUR128(self):
+            v = self._ebur_val
+            return lambda stereo: (None, None, v, None)
+
+    def test_nan_from_ebur128_falls_to_floor(self):
+        import math
+        es = self._FakeES(float("nan"))
+        out = ea._integrated_lufs([0.0, 0.1, 0.2], es)
+        assert math.isfinite(out)
+        assert out == ea._LUFS_FLOOR
+
+    def test_neg_inf_from_ebur128_falls_to_floor(self):
+        import math
+        es = self._FakeES(float("-inf"))
+        out = ea._integrated_lufs([0.0, 0.1], es)
+        assert math.isfinite(out)
+
+    def test_finite_value_passes_through(self):
+        es = self._FakeES(-12.3)
+        assert ea._integrated_lufs([0.1], es) == -12.3
+
+
+class TestDanceabilityScore:
+    def test_monotonic_and_clamped(self):
+        vals = [ea._danceability_score(x) for x in (0.0, 0.8, 1.5, 2.3, 3.0)]
+        assert vals[0] == 0 and vals[-1] == 100
+        assert vals == sorted(vals)
+
+    def test_spreads_typical_range(self):
+        """Typical music raw danceability (~1.2–1.7) must NOT collapse into a
+        narrow mid band — the whole reason we dropped the ÷3.0 mapping."""
+        low, high = ea._danceability_score(1.2), ea._danceability_score(1.7)
+        assert high - low >= 25  # meaningfully separated
+
+
+class TestAnalyzeAudioShape:
+    """analyze_audio must return the new fields with sane types/ranges.
+    Uses a real downloaded .ogg if present, else skips (no network)."""
+
+    def _sample(self):
+        from pathlib import Path
+        files = sorted(Path(".audio_files").glob("*.ogg")) if Path(".audio_files").exists() else []
+        return files[0] if files else None
+
+    def test_returns_new_fields_in_range(self):
+        sample = self._sample()
+        if sample is None:
+            pytest.skip("no downloaded .ogg available")
+        r = ea.analyze_audio(sample)
+        for k in ("bpm", "key", "camelot", "energy", "danceability", "loudness"):
+            assert k in r, k
+        assert 0 <= r["energy"] <= 100
+        assert 0 <= r["danceability"] <= 100
+        assert -60.0 <= r["loudness"] <= 0.0
+        assert r["bpm"] > 0
+
+
 class TestKeyToCamelot:
     @pytest.mark.parametrize("key,scale,expected", [
         ("C", "major", "8B"),

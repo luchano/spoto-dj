@@ -340,12 +340,24 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
     if not library:
         raise HTTPException(400, "Load tracks first via /api/tracks")
 
-    if not GETSONGBPM_API_KEY:
+    if not USE_LOCAL_ANALYSIS and not GETSONGBPM_API_KEY:
         raise HTTPException(503, "GETSONGBPM_API_KEY not configured")
 
     cache = load_cache()
     _analysis_state["results"] = {k: v for k, v in cache.items() if "error" not in v}
-    to_analyze = [t for t in library if t["id"] not in cache]
+
+    def _needs_analysis(t: dict) -> bool:
+        entry = cache.get(t["id"])
+        if entry is None:
+            return True
+        # Local mode: re-analyze entries cached before the loudness/danceability
+        # calibration (they lack 'loudness' and carry the old saturated energy).
+        # Re-analysis is cheap — the audio file is already downloaded.
+        if USE_LOCAL_ANALYSIS and "error" not in entry and "loudness" not in entry:
+            return True
+        return False
+
+    to_analyze = [t for t in library if _needs_analysis(t)]
 
     # Tracks in cache but with no Last.fm genre tags → backfill silently alongside
     # BPM analysis. We re-query empty results too (not just missing ones): the

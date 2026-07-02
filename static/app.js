@@ -145,10 +145,17 @@ function applyAnalysisResults(results) {
   allTracks.forEach(t => {
     const r = results[t.id];
     if (!r || r.error) return;
-    if (t.bpm === 0) {
-      t.bpm = r.bpm; t.key = r.key; t.camelot = r.camelot; t.energy = r.energy;
-      changed = true;
-    }
+    // Analysis results are authoritative — apply whenever present, not only
+    // when bpm is still 0. This lets a re-analysis (e.g. recalibrated energy)
+    // overwrite older cached values instead of being blocked by the old gate.
+    const set = (field, val) => {
+      if (val != null && t[field] !== val) { t[field] = val; changed = true; }
+    };
+    if (r.bpm) { set("bpm", r.bpm); set("key", r.key); set("camelot", r.camelot); }
+    set("energy", r.energy);
+    // essentia also fills these (Spotify's audio features 403 on new apps)
+    set("danceability", r.danceability);
+    set("loudness", r.loudness);
     // Track-level analyzed genres (essentia in local mode, Last.fm in legacy)
     // kept separate from Spotify artist genres so both show side by side.
     if (r.track_genres && r.track_genres.length) {
