@@ -7,6 +7,7 @@ numpy==1.26.4
 soundfile==0.12.1
 yt-dlp>=2025.1.1
 
-# Local audio analysis pipeline (opt-in via USE_LOCAL_ANALYSIS=true)
-spotdl>=4.2.0
+# Local audio analysis pipeline (opt-in via USE_LOCAL_ANALYSIS=true).
+# The downloader (zotify) is NOT listed here — it needs Python 3.10+ and lives
+# in its own venv (.venv-dl), driven as a subprocess. See essentia_analysis.py.
 essentia-tensorflow>=2.1b6.dev1110

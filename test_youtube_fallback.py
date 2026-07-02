@@ -37,6 +37,15 @@ def reset_analysis_state():
     m._analysis_state.update(blank)
 
 
+@pytest.fixture(autouse=True)
+def force_legacy_analysis(monkeypatch):
+    """These tests exercise the GetSongBPM + YouTube fallback path, which only
+    runs when USE_LOCAL_ANALYSIS is off. Pin it so the suite is deterministic
+    even when the operator has local (zotify/essentia) analysis enabled in .env."""
+    import main as m
+    monkeypatch.setattr(m, "USE_LOCAL_ANALYSIS", False)
+
+
 # ── UNIT: fallback logic in main._run_analysis ────────────────────────────────
 
 async def test_youtube_fallback_called_on_not_found():

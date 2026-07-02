@@ -54,10 +54,10 @@ SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 GETSONGBPM_API_KEY = os.getenv("GETSONGBPM_API_KEY", "")
 LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "")
 
-# Local audio pipeline (spotdl + essentia).
+# Local audio pipeline (zotify + essentia).
 # Set USE_LOCAL_ANALYSIS=true to use this instead of GetSongBPM + Last.fm.
+# zotify setup (one-time) is documented in essentia_analysis.py.
 USE_LOCAL_ANALYSIS = os.getenv("USE_LOCAL_ANALYSIS", "false").lower() == "true"
-YOUTUBE_COOKIE_FILE = os.getenv("YOUTUBE_COOKIE_FILE", "")  # path to Netscape cookies.txt
 
 SCOPES = "user-library-read playlist-modify-public playlist-modify-private"
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
@@ -108,7 +108,7 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
     to_genre_backfill — tracks already in cache but missing track_genres; genre only
     cache             — full audio cache dict (mutated in place)
 
-    When USE_LOCAL_ANALYSIS=true: downloads audio via spotdl and analyzes with essentia.
+    When USE_LOCAL_ANALYSIS=true: downloads audio via zotify and analyzes with essentia.
     Otherwise: uses GetSongBPM API + Last.fm (original flow).
     """
     log.info(
@@ -119,20 +119,18 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
     bpm_sem = asyncio.Semaphore(2)   # conservative for GetSongBPM free tier
     lfm_sem = asyncio.Semaphore(5)   # Last.fm allows 5 req/s on free tier
     yt_sem  = asyncio.Semaphore(3)   # YouTube downloads: 3 concurrent max
-    # Local pipeline: limit concurrent downloads to avoid hammering YouTube
-    local_sem = asyncio.Semaphore(2)
+    # Local pipeline: downloads MUST be strictly sequential (one zotify
+    # subprocess at a time) — the recommended anti-rate-limit pattern.
+    local_sem = asyncio.Semaphore(1)
 
     async def _local_lookup(track: dict):
-        """Download + analyze locally with spotdl + essentia."""
+        """Download + analyze locally with zotify + essentia."""
         return await _local_analyze(
             track_id=track["id"],
             spotify_url=track.get("spotify_url", ""),
             title=track.get("title", ""),
             artists=track.get("artists", ""),
-            spotify_client_id=CLIENT_ID,
-            spotify_client_secret=CLIENT_SECRET,
             semaphore=local_sem,
-            cookie_file=YOUTUBE_COOKIE_FILE or None,
         )
 
     async def _lookup(track: dict):

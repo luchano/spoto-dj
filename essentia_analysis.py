@@ -1,21 +1,68 @@
 """
-Local audio pipeline: spotdl download + essentia analysis + genre classification.
+Local audio pipeline: zotify download + essentia analysis + genre classification.
 
 Replaces GetSongBPM API and Last.fm for BPM, key, energy and genre detection.
 
 Flow per track:
-  1. download_track()    — spotdl downloads audio from YouTube Music via Spotify URL
+  1. download_track()    — zotify (Googolplexed0 fork) downloads the native
+                           96 kbps Ogg Vorbis stream directly from Spotify
   2. analyze_audio()     — essentia extracts BPM, key, camelot, energy
   3. classify_genre()    — essentia-tensorflow Discogs model predicts genre tags
   4. analyze_track_full()— combines all three; call this from main.py
+
+zotify lives in its own venv (.venv-dl, Python 3.10+) and is driven as a
+subprocess — the app venv stays on Python 3.9. One-time setup:
+
+  /opt/homebrew/bin/python3.12 -m venv .venv-dl
+  .venv-dl/bin/pip install git+https://github.com/Googolplexed0/zotify.git
+  # First run opens a Spotify OAuth login in the browser (interactive, once);
+  # the refresh token is saved and later runs are fully non-interactive.
+
+96 kbps is plenty for analysis: the essentia genre model resamples to 16 kHz
+mono anyway, and BPM/key features live in low-mid frequencies that lossy
+codecs preserve well (the legacy pipeline analyzed 64 kbps MP3s fine).
 """
 import asyncio
 import logging
 import os
+import random
+import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
 log = logging.getLogger(__name__)
+
+# zotify CLI in its dedicated venv. Override with ZOTIFY_BIN.
+ZOTIFY_BIN = os.getenv(
+    "ZOTIFY_BIN", str(Path(__file__).parent / ".venv-dl" / "bin" / "zotify")
+)
+
+# Where zotify stores its saved OAuth credentials. Mirrors zotify's own
+# per-platform default (Config.get_credentials_location). Override with
+# ZOTIFY_CREDENTIALS if you passed --creds to the login step.
+_ZOTIFY_CRED_DEFAULTS = {
+    "darwin": Path.home() / "Library/Application Support/Zotify/credentials.json",
+    "linux": Path.home() / ".local/share/zotify/credentials.json",
+    "win32": Path.home() / "AppData/Roaming/Zotify/credentials.json",
+}
+ZOTIFY_CREDENTIALS = Path(
+    os.getenv("ZOTIFY_CREDENTIALS",
+              str(_ZOTIFY_CRED_DEFAULTS.get(sys.platform, Path.cwd() / ".zotify/credentials.json")))
+)
+
+# Real-time pacing multiplier passed to zotify's --download-rate-limiter.
+# 1.0 = download at playback speed (strongest anti-flag mitigation, the
+# recommended setting for bulk library runs). 0 disables pacing.
+ZOTIFY_RATE_LIMITER = os.getenv("ZOTIFY_RATE_LIMITER", "1.0")
+
+# Max seconds to wait for one track download. Real-time pacing means a track
+# takes roughly its own duration to download, so allow generous headroom.
+ZOTIFY_TIMEOUT = int(os.getenv("ZOTIFY_TIMEOUT", "900"))
+
+# Random extra wait (seconds, up to this value) before each download, so
+# sequential audio-key requests don't fire in a perfectly regular rhythm.
+ZOTIFY_PACING_JITTER = float(os.getenv("ZOTIFY_PACING_JITTER", "5"))
 
 # Directory where downloaded audio files are stored permanently.
 # Override with env var SPOTO_AUDIO_DIR.
@@ -168,81 +215,136 @@ def _ensure_dir(path: Path):
 # Download
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Spotdl singleton — created once and reused across all track downloads.
-# spotdl raises "A spotify client has already been initialized" if you
-# instantiate Spotdl more than once per process.
-_spotdl_client = None
+def _find_downloaded(track_id: str) -> Optional[Path]:
+    """Return the cached audio file for a track, if any."""
+    for ext in (".ogg", ".m4a", ".mp3", ".opus", ".flac", ".wav"):
+        cached = AUDIO_DIR / f"{track_id}{ext}"
+        if cached.exists():
+            return cached
+    return None
 
 
-def _get_spotdl_client(
-    client_id: str,
-    client_secret: str,
-    cookie_file: Optional[str] = None,
-):
-    global _spotdl_client
-    if _spotdl_client is not None:
-        return _spotdl_client
-
-    try:
-        from spotdl import Spotdl
-    except ImportError:
-        raise RuntimeError("spotdl not installed — run: pip install spotdl")
-
-    settings = {
-        "output": str(AUDIO_DIR / "{track-id}.{output-ext}"),
-        "format": "m4a",
-        "bitrate": "disable",
-        "threads": 1,
-        "log_level": "CRITICAL",
-    }
-    if cookie_file and Path(cookie_file).exists():
-        settings["cookie_file"] = cookie_file
-        log.info("Using YouTube cookie file for higher quality download")
-
-    _spotdl_client = Spotdl(
-        client_id=client_id,
-        client_secret=client_secret,
-        downloader_settings=settings,
-    )
-    return _spotdl_client
-
-
-def download_track(
-    spotify_url: str,
-    track_id: str,
-    client_id: str,
-    client_secret: str,
-    cookie_file: Optional[str] = None,
-) -> Optional[Path]:
+def zotify_logged_in() -> bool:
     """
-    Download audio for a Spotify track via spotdl (sources from YouTube Music).
+    True if zotify has saved OAuth credentials.
 
-    Returns the path to the downloaded audio file, or None on failure.
-    Files are stored permanently in AUDIO_DIR so they are not re-downloaded.
+    Critical guard: if this is False, zotify would fall into its interactive
+    browser-login flow, whose OAuth callback server binds all interfaces
+    (0.0.0.0) and triggers the macOS "find devices on your local network"
+    prompt. That login must be done ONCE, by hand, via setup_zotify.py — never
+    unattended from the web server. We check this before ever spawning zotify.
+    """
+    return ZOTIFY_CREDENTIALS.exists()
+
+
+def build_zotify_command(spotify_url: str) -> list:
+    """
+    Build the zotify CLI invocation for a single track at the lowest quality.
+
+    Output lands at AUDIO_DIR/{spotify track id}.ogg (96 kbps Vorbis, no
+    transcode). Every metadata extra is disabled: fewer per-track API calls
+    means less rate-limit exposure (see Googolplexed0/zotify issue #209), and
+    tags are irrelevant for analysis.
+    """
+    return [
+        ZOTIFY_BIN,
+        "--download-quality", "normal",          # 96 kbps Ogg Vorbis (lowest tier)
+        "--codec", "copy",                        # keep native stream, no ffmpeg
+        "--root-path", str(AUDIO_DIR),
+        "--output-single", "{id}",                # → AUDIO_DIR/<track_id>.ogg
+        "--download-lyrics", "False",
+        "--lyrics-to-file", "False",
+        "--lyrics-to-metadata", "False",
+        "--album-art-jpg-file", "False",
+        "--md-save-genres", "False",              # extra API call per track — skip
+        "--md-disc-track-totals", "False",        # extra API call per track — skip
+        "--disable-song-archive", "True",
+        "--disable-directory-archives", "True",
+        "--download-rate-limiter", ZOTIFY_RATE_LIMITER,
+        "--retry-attempts", "3",
+        "--print-splash", "False",
+        "--print-progress-info", "False",
+        "--print-download-progress", "False",
+        spotify_url,
+    ]
+
+
+def download_track(spotify_url: str, track_id: str) -> Optional[Path]:
+    """
+    Download a track's audio directly from Spotify via zotify (subprocess).
+
+    Returns the path to the downloaded .ogg, or None on failure. Files are
+    stored permanently in AUDIO_DIR so they are never re-downloaded; zotify
+    itself also skips existing files (--skip-existing defaults to True).
+
+    Requires one-time interactive OAuth setup (see module docstring). If the
+    saved credentials are missing, zotify would block waiting for a browser
+    login — we detect that case and fail fast with a clear message instead.
     """
     _ensure_dir(AUDIO_DIR)
 
-    # Return cached file if already downloaded
-    for ext in (".m4a", ".mp3", ".opus", ".ogg", ".flac", ".wav"):
-        cached = AUDIO_DIR / f"{track_id}{ext}"
-        if cached.exists():
-            log.info("Audio already downloaded: %s", cached)
-            return cached
+    cached = _find_downloaded(track_id)
+    if cached:
+        log.info("Audio already downloaded: %s", cached)
+        return cached
 
+    if not Path(ZOTIFY_BIN).exists():
+        log.error(
+            "zotify not found at %s — create .venv-dl and pip install "
+            "git+https://github.com/Googolplexed0/zotify.git (see essentia_analysis.py)",
+            ZOTIFY_BIN,
+        )
+        return None
+
+    # Never let the server trigger zotify's interactive login (it binds 0.0.0.0
+    # and pops the macOS local-network prompt). Require the one-time manual
+    # login via setup_zotify.py first.
+    if not zotify_logged_in():
+        log.error(
+            "zotify has no saved credentials at %s — run the one-time login "
+            "first:  .venv-dl/bin/python setup_zotify.py",
+            ZOTIFY_CREDENTIALS,
+        )
+        return None
+
+    cmd = build_zotify_command(spotify_url)
+    log.info("Downloading %s via zotify …", track_id)
     try:
-        client = _get_spotdl_client(client_id, client_secret, cookie_file)
-        songs = client.search([spotify_url])
-        if not songs:
-            log.warning("spotdl: no YouTube match for %s", spotify_url)
-            return None
-        _, path = client.download(songs[0])
-        if path and Path(path).exists():
-            log.info("Downloaded: %s → %s", track_id, path)
-            return Path(path)
+        proc = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=ZOTIFY_TIMEOUT,
+            stdin=subprocess.DEVNULL,  # never let it block on interactive input
+        )
+    except subprocess.TimeoutExpired:
+        log.warning("zotify timed out (>%ss) for %s", ZOTIFY_TIMEOUT, track_id)
         return None
-    except Exception as e:
-        log.warning("spotdl failed for %s: %s", track_id, e)
+    except OSError as e:
+        log.error("could not run zotify (%s): %s", ZOTIFY_BIN, e)
         return None
+
+    # Ground truth is the output file — zotify's exit code can mask errors
+    # (Googolplexed0/zotify issue #222).
+    path = _find_downloaded(track_id)
+    if path:
+        log.info("Downloaded: %s → %s", track_id, path)
+        return path
+
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    if "login" in combined.lower() and "http" in combined.lower():
+        log.error(
+            "zotify needs its one-time OAuth login. Run this in a terminal and "
+            "complete the browser login:  %s <any spotify track url>",
+            ZOTIFY_BIN,
+        )
+    else:
+        tail = combined.strip().splitlines()[-8:]
+        log.warning(
+            "zotify produced no file for %s (exit %s): %s",
+            track_id, proc.returncode, " | ".join(tail),
+        )
+    return None
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -369,10 +471,7 @@ async def analyze_track_full(
     spotify_url: str,
     title: str,
     artists: str,
-    spotify_client_id: str,
-    spotify_client_secret: str,
     semaphore: asyncio.Semaphore,
-    cookie_file: Optional[str] = None,
     skip_genre: bool = False,
 ) -> tuple:
     """
@@ -380,17 +479,21 @@ async def analyze_track_full(
 
     result_dict contains: bpm, key, camelot, energy, track_genres, source="local"
     or {"error": "..."} on failure.
+
+    Downloads must run strictly sequentially (semaphore of 1) with jittered
+    pacing — that is the recommended anti-rate-limit pattern for zotify.
     """
     async with semaphore:
         loop = asyncio.get_event_loop()
 
+        # Jittered pause so sequential downloads don't fire in a perfectly
+        # regular rhythm (skipped when the file is already cached).
+        if ZOTIFY_PACING_JITTER > 0 and not _find_downloaded(track_id):
+            await asyncio.sleep(random.uniform(0, ZOTIFY_PACING_JITTER))
+
         # Download
         audio_path = await loop.run_in_executor(
-            None,
-            download_track,
-            spotify_url, track_id,
-            spotify_client_id, spotify_client_secret,
-            cookie_file,
+            None, download_track, spotify_url, track_id,
         )
         if not audio_path:
             return track_id, {"error": f"audio download failed for '{title}'"}
