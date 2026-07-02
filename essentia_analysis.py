@@ -168,6 +168,45 @@ def _ensure_dir(path: Path):
 # Download
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Spotdl singleton — created once and reused across all track downloads.
+# spotdl raises "A spotify client has already been initialized" if you
+# instantiate Spotdl more than once per process.
+_spotdl_client = None
+
+
+def _get_spotdl_client(
+    client_id: str,
+    client_secret: str,
+    cookie_file: Optional[str] = None,
+):
+    global _spotdl_client
+    if _spotdl_client is not None:
+        return _spotdl_client
+
+    try:
+        from spotdl import Spotdl
+    except ImportError:
+        raise RuntimeError("spotdl not installed — run: pip install spotdl")
+
+    settings = {
+        "output": str(AUDIO_DIR / "{track-id}.{output-ext}"),
+        "format": "m4a",
+        "bitrate": "disable",
+        "threads": 1,
+        "log_level": "CRITICAL",
+    }
+    if cookie_file and Path(cookie_file).exists():
+        settings["cookie_file"] = cookie_file
+        log.info("Using YouTube cookie file for higher quality download")
+
+    _spotdl_client = Spotdl(
+        client_id=client_id,
+        client_secret=client_secret,
+        downloader_settings=settings,
+    )
+    return _spotdl_client
+
+
 def download_track(
     spotify_url: str,
     track_id: str,
@@ -191,28 +230,7 @@ def download_track(
             return cached
 
     try:
-        from spotdl import Spotdl
-    except ImportError:
-        log.error("spotdl not installed — run: pip install spotdl")
-        return None
-
-    settings = {
-        "output": str(AUDIO_DIR / f"{track_id}.{{output-ext}}"),
-        "format": "m4a",
-        "bitrate": "disable",  # no re-encoding; keeps original stream quality
-        "threads": 1,
-        "log_level": "CRITICAL",
-    }
-    if cookie_file and Path(cookie_file).exists():
-        settings["cookie_file"] = cookie_file
-        log.info("Using YouTube cookie file for higher quality download")
-
-    try:
-        client = Spotdl(
-            client_id=client_id,
-            client_secret=client_secret,
-            downloader_settings=settings,
-        )
+        client = _get_spotdl_client(client_id, client_secret, cookie_file)
         songs = client.search([spotify_url])
         if not songs:
             log.warning("spotdl: no YouTube match for %s", spotify_url)
