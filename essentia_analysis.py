@@ -548,6 +548,7 @@ async def analyze_track_full(
     artists: str,
     semaphore: asyncio.Semaphore,
     skip_genre: bool = False,
+    on_stage=None,
 ) -> tuple:
     """
     Download + analyze a track. Returns (track_id, result_dict).
@@ -557,7 +558,18 @@ async def analyze_track_full(
 
     Downloads must run strictly sequentially (semaphore of 1) with jittered
     pacing — that is the recommended anti-rate-limit pattern for zotify.
+
+    on_stage: optional callable(stage: str) fired when the track actually
+    starts each phase ("downloading", "analyzing") — i.e. after acquiring the
+    sequential slot, so the caller can surface live progress.
     """
+    def _stage(name: str):
+        if on_stage:
+            try:
+                on_stage(name)
+            except Exception:  # progress reporting must never break analysis
+                pass
+
     async with semaphore:
         loop = asyncio.get_event_loop()
 
@@ -567,6 +579,7 @@ async def analyze_track_full(
             await asyncio.sleep(random.uniform(0, ZOTIFY_PACING_JITTER))
 
         # Download
+        _stage("downloading")
         audio_path = await loop.run_in_executor(
             None, download_track, spotify_url, track_id,
         )
@@ -574,6 +587,7 @@ async def analyze_track_full(
             return track_id, {"error": f"audio download failed for '{title}'"}
 
         # Analyze BPM / key / energy
+        _stage("analyzing")
         try:
             result = await loop.run_in_executor(None, analyze_audio, audio_path)
         except Exception as e:

@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import secrets
+import time
 import urllib.parse
 from pathlib import Path
 
@@ -74,6 +75,8 @@ _analysis_state: dict = {
     "total": 0,
     "done": 0,
     "results": {},
+    "current": None,      # {title, artists, stage: downloading|analyzing, started: epoch}
+    "last_done": None,    # {title, bpm, finished: epoch}
 }
 
 static_dir = Path(__file__).parent / "static"
@@ -125,12 +128,22 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
 
     async def _local_lookup(track: dict):
         """Download + analyze locally with zotify + essentia."""
+        def _on_stage(stage: str):
+            # Fires when this track actually acquires the download slot
+            # (sequential), so "current" reflects the live pipeline state.
+            _analysis_state["current"] = {
+                "title": track.get("title", ""),
+                "artists": track.get("artists", ""),
+                "stage": stage,
+                "started": time.time(),
+            }
         return await _local_analyze(
             track_id=track["id"],
             spotify_url=track.get("spotify_url", ""),
             title=track.get("title", ""),
             artists=track.get("artists", ""),
             semaphore=local_sem,
+            on_stage=_on_stage,
         )
 
     async def _lookup(track: dict):
@@ -182,6 +195,8 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
                 _analysis_state["results"][tid]["track_genres"] = lfm_tags
 
     lookup_fn = _local_lookup if USE_LOCAL_ANALYSIS else _lookup
+    titles = {t["id"]: t.get("title", "") for t in tracks}
+
     tasks          = [asyncio.create_task(lookup_fn(t)) for t in tracks]
     # Genre backfill: use local pipeline if enabled (re-classify existing audio files),
     # otherwise fall back to Last.fm
@@ -209,6 +224,11 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
         else:
             cache[track_id] = result
             _analysis_state["results"][track_id] = result
+            _analysis_state["last_done"] = {
+                "title": titles.get(track_id, track_id),
+                "bpm": result.get("bpm"),
+                "finished": time.time(),
+            }
         _analysis_state["done"] += 1
         # Persist after every track: the local pipeline is slow and often
         # interrupted (server restart), so a coarse checkpoint would lose all
@@ -221,6 +241,7 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
     # BPM analysis done — mark complete so the frontend stops the progress bar
     save_cache(cache)
     _analysis_state["running"] = False
+    _analysis_state["current"] = None
     log.info("BPM done: %d/%d found, %d errors", len(tracks) - errors, len(tracks), errors)
 
     # Genre backfill — already marked backfilling=True in start_analyze before response was sent
@@ -391,6 +412,8 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
         "backfilling": bool(to_genre_backfill),
         "total": len(to_analyze),
         "done": 0,
+        "current": None,
+        "last_done": None,
     })
 
     if to_analyze or to_genre_backfill:
@@ -406,12 +429,17 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
 
 @app.get("/api/analyze/status")
 async def analyze_status():
+    current = _analysis_state.get("current")
+    if current:
+        current = {**current, "elapsed": round(time.time() - current["started"])}
     return JSONResponse({
         "running":    _analysis_state["running"],
         "backfilling": _analysis_state["backfilling"],
         "done":       _analysis_state["done"],
         "total":      _analysis_state["total"],
         "results":    _analysis_state["results"],
+        "current":    current,
+        "last_done":  _analysis_state.get("last_done"),
     })
 
 

@@ -123,12 +123,14 @@ async function pollAnalysis() {
   applyAnalysisResults(data.results);
   const pct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 100;
   setBannerMsg(`Analizando… ${data.done} / ${data.total} canciones`, pct);
+  setBannerDetail(data.current, data.last_done);
 
   if (!data.running && !data.backfilling) {
     clearInterval(pollTimer);
     pollTimer = null;
     setRefreshBtn(false);
     setBannerMsg(`Metadatos cargados: ${Object.keys(data.results).length} canciones`, 100);
+    setBannerDetail(null, data.last_done);
     setTimeout(() => { document.getElementById("analysis-banner").style.display = "none"; }, 3000);
     const sel = document.getElementById("key-filter");
     sel.innerHTML = '<option value="">All keys</option>';
@@ -137,6 +139,23 @@ async function pollAnalysis() {
   } else if (!data.running && data.backfilling) {
     setBannerMsg("Actualizando géneros…", 99);
   }
+}
+
+function setBannerDetail(current, lastDone) {
+  const el = document.getElementById("analysis-detail");
+  if (!el) return;
+  const parts = [];
+  if (current) {
+    const m = Math.floor((current.elapsed || 0) / 60);
+    const s = String((current.elapsed || 0) % 60).padStart(2, "0");
+    const verb = current.stage === "analyzing" ? "🎧 Analizando" : "⬇️ Descargando";
+    parts.push(`${verb} <strong>${current.title}</strong> — ${current.artists} · ${m}:${s}`);
+  }
+  if (lastDone && lastDone.title) {
+    const bpm = lastDone.bpm ? ` (${lastDone.bpm} BPM)` : "";
+    parts.push(`✓ Última: <strong>${lastDone.title}</strong>${bpm}`);
+  }
+  el.innerHTML = parts.join("&nbsp;&nbsp;·&nbsp;&nbsp;");
 }
 
 function applyAnalysisResults(results) {

@@ -161,6 +161,32 @@ class TestAnalyzeTrackFull:
         assert tid == TRACK_ID
         assert "error" in result and "download failed" in result["error"]
 
+    def test_on_stage_fires_downloading_then_analyzing(self, audio_dir, monkeypatch):
+        monkeypatch.setattr(ea, "ZOTIFY_PACING_JITTER", 0.0)
+        fake_path = audio_dir / f"{TRACK_ID}.ogg"
+        stages = []
+        with patch.object(ea, "download_track", return_value=fake_path), \
+             patch.object(ea, "analyze_audio", return_value={"bpm": 120}), \
+             patch.object(ea, "classify_genre", return_value=[]):
+            self._run(ea.analyze_track_full(
+                TRACK_ID, TRACK_URL, "Song", "Artist", asyncio.Semaphore(1),
+                on_stage=stages.append,
+            ))
+        assert stages == ["downloading", "analyzing"]
+
+    def test_on_stage_exception_does_not_break_analysis(self, audio_dir, monkeypatch):
+        monkeypatch.setattr(ea, "ZOTIFY_PACING_JITTER", 0.0)
+        fake_path = audio_dir / f"{TRACK_ID}.ogg"
+        def boom(_stage): raise RuntimeError("ui broke")
+        with patch.object(ea, "download_track", return_value=fake_path), \
+             patch.object(ea, "analyze_audio", return_value={"bpm": 120}), \
+             patch.object(ea, "classify_genre", return_value=[]):
+            tid, result = self._run(ea.analyze_track_full(
+                TRACK_ID, TRACK_URL, "Song", "Artist", asyncio.Semaphore(1),
+                on_stage=boom,
+            ))
+        assert "error" not in result
+
     def test_success_merges_analysis_and_genres(self, audio_dir, monkeypatch):
         monkeypatch.setattr(ea, "ZOTIFY_PACING_JITTER", 0.0)
         fake_path = audio_dir / f"{TRACK_ID}.ogg"
