@@ -111,14 +111,21 @@ queue_status() {
   echo "Analysis queue:"
   echo "  analyzed:     ${analyzed}${total:+ / ${total}} tracks   (${oggs} audio files on disk)"
 
-  # What zotify is downloading right now, and for how long.
+  # What zotify is downloading right now, and for how long. Read the pacing
+  # straight from the live process args — that's the truth, not the config.
   local zpid; zpid="$(pgrep -f 'venv-dl/bin/zotify' 2>/dev/null | head -1 || true)"
   if [[ -n "$zpid" ]]; then
-    local info et tid
+    local info et tid rate pace
     info="$(ps -o etime=,command= -p "$zpid" 2>/dev/null || true)"
     et="$(echo "$info" | awk '{print $1}')"
     tid="$(echo "$info" | grep -oE 'track/[A-Za-z0-9]+' | head -1 | cut -d/ -f2 || true)"
-    echo "  downloading:  ${tid:-?}  (elapsed ${et:-?})  — real-time paced, ~track length"
+    rate="$(echo "$info" | grep -oE 'download-rate-limiter [0-9.]+' | awk '{print $2}' || true)"
+    case "$rate" in
+      ""|0|0.0) pace="full speed" ;;
+      1|1.0)    pace="real-time paced (1x), ~track length" ;;
+      *)        pace="paced at ${rate}x of track length" ;;
+    esac
+    echo "  downloading:  ${tid:-?}  (elapsed ${et:-?})  — ${pace}"
   else
     echo "  downloading:  idle (no download in progress)"
   fi

@@ -31,6 +31,16 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+# Load .env BEFORE the module-level os.getenv() reads below. main.py imports
+# this module before it calls load_dotenv(), so without this the ZOTIFY_*
+# overrides in .env would silently fall back to their defaults (e.g. the
+# download rate limiter staying at 1.0 despite .env saying otherwise).
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:  # pragma: no cover — always present in the app venv
+    pass
+
 log = logging.getLogger(__name__)
 
 # zotify CLI in its dedicated venv. Override with ZOTIFY_BIN.
