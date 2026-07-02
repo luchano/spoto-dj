@@ -78,123 +78,30 @@ _KEY_TO_PITCH = {
     "Db": 1, "Eb": 3, "Gb": 6, "Ab": 8, "Bb": 10,
 }
 
-# Discogs 400 genre labels in model output order.
-# Source: https://essentia.upf.edu/models/classification-heads/genre_discogs400/
-DISCOGS400_LABELS = [
-    "Blues---Boogie Woogie", "Blues---Chicago Blues", "Blues---Country Blues",
-    "Blues---Delta Blues", "Blues---Electric Blues", "Blues---Harmonica Blues",
-    "Blues---Jump Blues", "Blues---Louisiana Blues", "Blues---Modern Electric Blues",
-    "Blues---Piano Blues", "Blues---Rhythm & Blues", "Blues---Texas Blues",
-    "Brass & Military---Brass Band", "Brass & Military---Marches",
-    "Brass & Military---Military", "Children's---Children's",
-    "Classical---Baroque", "Classical---Choral", "Classical---Classical",
-    "Classical---Contemporary", "Classical---Impressionist", "Classical---Medieval",
-    "Classical---Modern", "Classical---Neo-Classical", "Classical---Neo-Romantic",
-    "Classical---Opera", "Classical---Post-Modern", "Classical---Renaissance",
-    "Classical---Romantic", "Electronic---Abstract", "Electronic---Ambient",
-    "Electronic---Bass Music", "Electronic---Bleep", "Electronic---Breakbeat",
-    "Electronic---Broken Beat", "Electronic---Dancehall", "Electronic---Dark Ambient",
-    "Electronic---Downtempo", "Electronic---Dub", "Electronic---Dub Techno",
-    "Electronic---Dubstep", "Electronic---Electro", "Electronic---Electroacoustic",
-    "Electronic---Electronic Rock", "Electronic---Footwork", "Electronic---Funk",
-    "Electronic---Funky Breaks", "Electronic---Future Jazz", "Electronic---Gabber",
-    "Electronic---Ghettotech", "Electronic---Glitch", "Electronic---Glitch Hop",
-    "Electronic---Grime", "Electronic---Halftime", "Electronic---Hardcore",
-    "Electronic---Hardstyle", "Electronic---Hi NRG", "Electronic---Hip Hop",
-    "Electronic---House", "Electronic---IDM", "Electronic---Illbient",
-    "Electronic---Industrial", "Electronic---Italo-Disco", "Electronic---Juke",
-    "Electronic---Jungle", "Electronic---Latin", "Electronic---Leftfield",
-    "Electronic---Minimal", "Electronic---Modern Classical", "Electronic---Musique Concrète",
-    "Electronic---Neo Trance", "Electronic---Noise", "Electronic---Nu-Disco",
-    "Electronic---Power Electronics", "Electronic---Progressive House",
-    "Electronic---Progressive Trance", "Electronic---Psy-Trance", "Electronic---Rhythmic Noise",
-    "Electronic---Screw", "Electronic---Soca", "Electronic---Soul",
-    "Electronic---Soundtrack", "Electronic---Synth-pop", "Electronic---Tech House",
-    "Electronic---Tech Trance", "Electronic---Techno", "Electronic---Trance",
-    "Electronic---Tribal", "Electronic---Tribal House", "Electronic---Trip Hop",
-    "Electronic---UK Garage", "Electronic---Vaporwave",
-    "Folk, World, & Country---African", "Folk, World, & Country---Bluegrass",
-    "Folk, World, & Country---Cajun", "Folk, World, & Country---Canzone Napoletana",
-    "Folk, World, & Country---Catalan Music", "Folk, World, & Country---Celtic",
-    "Folk, World, & Country---Country", "Folk, World, & Country---Fado",
-    "Folk, World, & Country---Flamenco", "Folk, World, & Country---Folk",
-    "Folk, World, & Country---Gospel", "Folk, World, & Country---Highlife",
-    "Folk, World, & Country---Hillbilly", "Folk, World, & Country---Hindustani",
-    "Folk, World, & Country---Honky Tonk", "Folk, World, & Country---Indian Classical",
-    "Folk, World, & Country---Isicathamiya", "Folk, World, & Country---Jive",
-    "Folk, World, & Country---Klezmer", "Folk, World, & Country---Laïkó",
-    "Folk, World, & Country---Latin", "Folk, World, & Country---Lutenist",
-    "Folk, World, & Country---Mbalax", "Folk, World, & Country---Merengue",
-    "Folk, World, & Country---Merseybeat", "Folk, World, & Country---Middle Eastern",
-    "Folk, World, & Country---Norteño", "Folk, World, & Country---Polka",
-    "Folk, World, & Country---Raï", "Folk, World, & Country---Reggae",
-    "Folk, World, & Country---Romani", "Folk, World, & Country---Salsa",
-    "Folk, World, & Country---Samba", "Folk, World, & Country---Séga",
-    "Folk, World, & Country---Soukous", "Folk, World, & Country---Tango",
-    "Folk, World, & Country---Volksmusik", "Folk, World, & Country---Zouk",
-    "Folk, World, & Country---Zydeco",
-    "Funk / Soul---Afrobeat", "Funk / Soul---Boogie", "Funk / Soul---Contemporary R&B",
-    "Funk / Soul---Disco", "Funk / Soul---Free Funk", "Funk / Soul---Funk",
-    "Funk / Soul---Gospel", "Funk / Soul---Neo Soul", "Funk / Soul---New Jack Swing",
-    "Funk / Soul---P.Funk", "Funk / Soul---Quiet Storm", "Funk / Soul---Soul",
-    "Hip Hop---Bass Music", "Hip Hop---Bounce", "Hip Hop---Conscious",
-    "Hip Hop---Crunk", "Hip Hop---Dirty South", "Hip Hop---East Coast Hip Hop",
-    "Hip Hop---Gangsta", "Hip Hop---Grime", "Hip Hop---Hardcore Hip-Hop",
-    "Hip Hop---Horrorcore", "Hip Hop---Hyphy", "Hip Hop---Instrumental",
-    "Hip Hop---Latin", "Hip Hop---Nerdcore", "Hip Hop---Old School Hip-Hop",
-    "Hip Hop---Political", "Hip Hop---Pop Rap", "Hip Hop---Ragga HipHop",
-    "Hip Hop---Southern Hip-Hop", "Hip Hop---Thug Rap", "Hip Hop---Trap",
-    "Hip Hop---Turntablism", "Hip Hop---Underground Hip-Hop", "Hip Hop---West Coast Hip-Hop",
-    "Jazz---Afro-Cuban Jazz", "Jazz---Avant-garde Jazz", "Jazz---Big Band",
-    "Jazz---Bop", "Jazz---Bossa Nova", "Jazz---Contemporary Jazz",
-    "Jazz---Cool Jazz", "Jazz---Dixieland", "Jazz---Ethio-jazz",
-    "Jazz---European Free Jazz", "Jazz---Free Jazz", "Jazz---Fusion",
-    "Jazz---Gypsy Jazz", "Jazz---Hard Bop", "Jazz---Jazz-Funk",
-    "Jazz---Jazz-Rock", "Jazz---Latin Jazz", "Jazz---Modal",
-    "Jazz---Post Bop", "Jazz---Ragtime", "Jazz---Smooth Jazz",
-    "Jazz---Soul-Jazz", "Jazz---Swing", "Jazz---Vocal",
-    "Latin---Afrobeat", "Latin---Bachata", "Latin---Batucada",
-    "Latin---Beguine", "Latin---Bolero", "Latin---Boogaloo",
-    "Latin---Bossanova", "Latin---Cha-Cha", "Latin---Charanga",
-    "Latin---Chicha", "Latin---Cumbia", "Latin---Forró",
-    "Latin---Guaracha", "Latin---Joropo", "Latin---Mambo",
-    "Latin---Merengue", "Latin---Norteño", "Latin---Nueva Canción",
-    "Latin---Nueva Trova", "Latin---Pachanga", "Latin---Porro",
-    "Latin---Ranchera", "Latin---Reggaeton", "Latin---Rumba",
-    "Latin---Salsa", "Latin---Samba", "Latin---Son",
-    "Latin---Son Cubano", "Latin---Tango", "Latin---Tejano",
-    "Latin---Timba", "Latin---Trova", "Latin---Vallenato",
-    "Non-Music---Audiobook", "Non-Music---Interview",
-    "Non-Music---Monolog", "Non-Music---Poetry", "Non-Music---Spoken Word",
-    "Pop---Ballad", "Pop---Bubblegum", "Pop---City Pop",
-    "Pop---Dance-pop", "Pop---Europop", "Pop---Folk Rock",
-    "Pop---Funk", "Pop---Indie Pop", "Pop---J-pop",
-    "Pop---K-pop", "Pop---Kayōkyoku", "Pop---Pop Rock",
-    "Pop---Power Pop", "Pop---Psychedelic", "Pop---Soft Rock",
-    "Pop---Synth-pop", "Pop---Teen Pop",
-    "Reggae---Calypso", "Reggae---Dancehall", "Reggae---Dub",
-    "Reggae---Lovers Rock", "Reggae---Ragga", "Reggae---Reggae",
-    "Reggae---Reggae-Pop", "Reggae---Rocksteady", "Reggae---Roots Reggae",
-    "Reggae---Ska", "Reggae---Soca",
-    "Rock---AOR", "Rock---Acid Rock", "Rock---Acoustic",
-    "Rock---Alternative Rock", "Rock---Arena Rock", "Rock---Art Rock",
-    "Rock---Blues Rock", "Rock---Classic Rock", "Rock---Country Rock",
-    "Rock---Disco", "Rock---Dream Pop", "Rock---Emo",
-    "Rock---Experimental", "Rock---Folk Rock", "Rock---Funk Rock",
-    "Rock---Garage Rock", "Rock---Glam", "Rock---Goth Rock",
-    "Rock---Grunge", "Rock---Hard Rock", "Rock---Hardcore",
-    "Rock---Heavy Metal", "Rock---Indie Rock", "Rock---Industrial",
-    "Rock---Krautrock", "Rock---Lo-fi", "Rock---Math Rock",
-    "Rock---Metal", "Rock---Mod", "Rock---Noise",
-    "Rock---Oldies", "Rock---Pop Rock", "Rock---Post Rock",
-    "Rock---Power Pop", "Rock---Progressive Rock", "Rock---Psychedelic Rock",
-    "Rock---Punk", "Rock---Rockabilly", "Rock---Shoegaze",
-    "Rock---Soft Rock", "Rock---Soul", "Rock---Southern Rock",
-    "Rock---Spoken Word", "Rock---Surf", "Rock---Swamp Pop",
-    "Rock---Technical Death Metal", "Rock---Thrash",
-    "Stage & Screen---Musical", "Stage & Screen---Score", "Stage & Screen---Soundtrack",
-    "Stage & Screen---Theme",
-]
+# Discogs-400 genre labels are loaded at runtime from the model's metadata JSON
+# (the authoritative 400-class list in exact output order). Hand-transcribing
+# them is error-prone — a mismatched/short list silently maps every prediction
+# to the wrong genre.
+_GENRE_LABELS_CACHE = None
+
+
+def _load_genre_labels() -> list:
+    """Return the 400 Discogs genre labels in model output order, or [] if the
+    metadata JSON is missing. Cached after first load."""
+    global _GENRE_LABELS_CACHE
+    if _GENRE_LABELS_CACHE is not None:
+        return _GENRE_LABELS_CACHE
+    import json
+    path = MODELS_DIR / _GENRE_LABELS_JSON
+    try:
+        classes = json.loads(path.read_text())["classes"]
+        if not isinstance(classes, list) or len(classes) < 100:
+            raise ValueError(f"unexpected classes payload ({type(classes)}, len={len(classes)})")
+        _GENRE_LABELS_CACHE = classes
+    except Exception as e:
+        log.error("Could not load genre labels from %s: %s — run download_models()", path, e)
+        _GENRE_LABELS_CACHE = []
+    return _GENRE_LABELS_CACHE
 
 
 def _key_to_camelot(key: str, scale: str) -> str:
@@ -496,9 +403,10 @@ def analyze_audio(audio_path: Path) -> dict:
 # Genre classification
 # ─────────────────────────────────────────────────────────────────────────────
 
-_EFFNET_MODEL  = "discogs-effnet-bs64-1.pb"
-_GENRE_MODEL   = "genre_discogs400-discogs-effnet-1.pb"
-_MODEL_BASE_URL = "https://essentia.upf.edu/models"
+_EFFNET_MODEL     = "discogs-effnet-bs64-1.pb"
+_GENRE_MODEL      = "genre_discogs400-discogs-effnet-1.pb"
+_GENRE_LABELS_JSON = "genre_discogs400-discogs-effnet-1.json"  # authoritative class list
+_MODEL_BASE_URL   = "https://essentia.upf.edu/models"
 
 
 def download_models():
@@ -510,9 +418,11 @@ def download_models():
 
     _ensure_dir(MODELS_DIR)
 
+    _genre_base = f"{_MODEL_BASE_URL}/classification-heads/genre_discogs400"
     models = {
         _EFFNET_MODEL: f"{_MODEL_BASE_URL}/feature-extractors/discogs-effnet/{_EFFNET_MODEL}",
-        _GENRE_MODEL:  f"{_MODEL_BASE_URL}/classification-heads/genre_discogs400/{_GENRE_MODEL}",
+        _GENRE_MODEL:  f"{_genre_base}/{_GENRE_MODEL}",
+        _GENRE_LABELS_JSON: f"{_genre_base}/{_GENRE_LABELS_JSON}",  # 400-class label map
     }
 
     for filename, url in models.items():
@@ -600,8 +510,16 @@ def classify_genre(audio_path: Path, top_n: int = 4) -> list:
         predictions = genre_model(embeddings)
         avg = np.mean(predictions, axis=0)
 
+        labels = _load_genre_labels()
+        if len(labels) != len(avg):
+            log.error(
+                "Genre label count (%d) != model outputs (%d); skipping genres",
+                len(labels), len(avg),
+            )
+            return []
+
         top_indices = np.argsort(avg)[::-1][:top_n]
-        raw = [DISCOGS400_LABELS[i] for i in top_indices if i < len(DISCOGS400_LABELS)]
+        raw = [labels[i] for i in top_indices]
         return _clean_genre_labels(raw)
 
     except Exception as e:

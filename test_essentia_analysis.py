@@ -181,6 +181,35 @@ class TestAnalyzeTrackFull:
 # Camelot conversion
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestGenreLabels:
+    def test_loader_returns_400_from_json(self, tmp_path, monkeypatch):
+        import json
+        classes = [f"G{i}" for i in range(400)]
+        (tmp_path / ea._GENRE_LABELS_JSON).write_text(json.dumps({"classes": classes}))
+        monkeypatch.setattr(ea, "MODELS_DIR", tmp_path)
+        monkeypatch.setattr(ea, "_GENRE_LABELS_CACHE", None)
+        assert ea._load_genre_labels() == classes
+
+    def test_missing_json_returns_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(ea, "MODELS_DIR", tmp_path)  # empty dir
+        monkeypatch.setattr(ea, "_GENRE_LABELS_CACHE", None)
+        assert ea._load_genre_labels() == []
+
+    def test_real_label_map_is_400_and_ordered(self):
+        """Guards the bug we hit: a short/mis-ordered label list silently maps
+        every prediction to the wrong genre. The real metadata must be 400
+        classes in the canonical Discogs order."""
+        from pathlib import Path
+        import json
+        p = Path(".essentia_models") / ea._GENRE_LABELS_JSON
+        if not p.exists():
+            pytest.skip("genre labels JSON not downloaded")
+        classes = json.loads(p.read_text())["classes"]
+        assert len(classes) == 400
+        assert classes[0] == "Blues---Boogie Woogie"
+        assert classes[-1] == "Stage & Screen---Theme"
+
+
 class TestCleanGenreLabels:
     def test_splits_parent_and_child(self):
         out = ea._clean_genre_labels(["Electronic---Glitch"])
