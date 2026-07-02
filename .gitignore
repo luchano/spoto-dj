@@ -20,3 +20,7 @@ build/
 .audio_files/
 .essentia_models/
 cookies.txt
+
+# dev.sh runtime files
+.dev-server.pid
+.dev-server.log
