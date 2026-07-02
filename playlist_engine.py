@@ -18,6 +18,7 @@ dropping energy before the climax makes the climax hit much harder.
 
 import json
 import uuid
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -677,8 +678,35 @@ def save_playlists(playlists: dict) -> None:
     PLAYLISTS_FILE.write_text(json.dumps(playlists, indent=2))
 
 
+def _dominant_genre(tracks: list) -> str:
+    """Return the most-common genre tag across all tracks, title-cased.
+
+    Prefers the ``genres`` field which, after the /api/tracks merge, already
+    holds Last.fm per-track tags when available and Spotify artist genres
+    otherwise.  Returns an empty string when no genre data is present.
+    """
+    counts: Counter = Counter()
+    for t in tracks:
+        tags = t.get("genres") or []
+        if isinstance(tags, str):
+            tags = [g.strip() for g in tags.split(",") if g.strip()]
+        for tag in tags:
+            if tag:
+                counts[tag.lower()] += 1
+    if not counts:
+        return ""
+    return counts.most_common(1)[0][0].title()
+
+
 def create_playlist(result: dict, params: dict, name: Optional[str] = None) -> dict:
-    """Persist a generate() result and return the stored playlist object."""
+    """Persist a generate() result and return the stored playlist object.
+
+    The automatic name follows the pattern:
+        [Prefix · ] Genre · Xmin · BPMmin–BPMmax BPM · Mon DD
+
+    ``name`` is treated as an optional **prefix** prepended before the
+    auto-generated parts, not as the full name.
+    """
     pid = f"pl_{uuid.uuid4().hex[:8]}"
 
     tracks_out = []
@@ -700,16 +728,37 @@ def create_playlist(result: dict, params: dict, name: Optional[str] = None) -> d
             "image_url":     t.get("image_url", ""),
         })
 
+    # ── Auto-name components ─────────────────────────────────────────────────
     duration_min = round(result["total_duration_ms"] / 60_000)
-    bpm_range    = params.get("bpm_range")
-    bpm_label    = f"{bpm_range[0]}–{bpm_range[1]} BPM" if bpm_range else f"{duration_min}min"
-    auto_name    = name or (
-        f"DJ Set {bpm_label} — {datetime.now(timezone.utc).strftime('%b %d')}"
-    )
+
+    bpm_range = params.get("bpm_range")
+    if bpm_range:
+        bpm_min, bpm_max = int(bpm_range[0]), int(bpm_range[1])
+    else:
+        bpms = [
+            t["bpm"] for t in result["tracks"]
+            if isinstance(t.get("bpm"), (int, float)) and t["bpm"] > 0
+        ]
+        bpm_min = int(min(bpms)) if bpms else 0
+        bpm_max = int(max(bpms)) if bpms else 0
+
+    genre    = _dominant_genre(result["tracks"])
+    date_str = datetime.now(timezone.utc).strftime("%b %d")
+
+    parts: List[str] = []
+    if genre:
+        parts.append(genre)
+    parts.append(f"{duration_min}min")
+    if bpm_min and bpm_max:
+        parts.append(f"{bpm_min}–{bpm_max} BPM")
+    parts.append(date_str)
+
+    auto_name = " · ".join(parts)
+    full_name = f"{name} · {auto_name}" if name else auto_name
 
     playlist = {
         "id":                   pid,
-        "name":                 auto_name,
+        "name":                 full_name,
         "created_at":           datetime.now(timezone.utc).isoformat(),
         "params":               params,
         "tracks":               tracks_out,

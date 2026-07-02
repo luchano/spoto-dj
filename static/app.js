@@ -302,26 +302,67 @@ function exportCSV() {
 // Playlists tab
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * Show a live preview of the auto-generated set name below the prefix field.
+ * Genre is omitted here (it depends on which tracks get selected); the server
+ * fills it in with the actual dominant genre when the set is generated.
+ */
+function updateNamePreview() {
+  const preview = document.getElementById("pl-name-preview");
+  if (!preview) return;
+
+  const prefix  = document.getElementById("pl-name").value.trim();
+  const dur     = document.getElementById("pl-duration").value + "min";
+  const bpmMin  = document.getElementById("pl-bpm-min").value;
+  const bpmMax  = document.getElementById("pl-bpm-max").value;
+
+  const now    = new Date();
+  const months = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  const day    = String(now.getDate()).padStart(2, "0");
+  const date   = `${months[now.getMonth()]} ${day}`;
+
+  const parts = ["[género]", dur];
+  const bpmMinP = parseInt(bpmMin), bpmMaxP = parseInt(bpmMax);
+  if (!isNaN(bpmMinP) && !isNaN(bpmMaxP) && bpmMinP < bpmMaxP) {
+    parts.push(`${bpmMinP}–${bpmMaxP} BPM`);
+  } else if (!isNaN(bpmMinP)) {
+    parts.push(`${bpmMinP}+ BPM`);
+  } else if (!isNaN(bpmMaxP)) {
+    parts.push(`up to ${bpmMaxP} BPM`);
+  }
+  parts.push(date);
+
+  const autoName = parts.join(" · ");
+  preview.textContent = "→ " + (prefix ? `${prefix} · ${autoName}` : autoName);
+}
+
 async function generatePlaylist() {
   const btn = document.getElementById("pl-generate-btn");
   const status = document.getElementById("pl-gen-status");
   btn.disabled = true;
   status.textContent = "Generating…";
 
-  const bpmMin = parseInt(document.getElementById("pl-bpm-min").value);
-  const bpmMax = parseInt(document.getElementById("pl-bpm-max").value);
+  const bpmMinRaw = parseInt(document.getElementById("pl-bpm-min").value);
+  const bpmMaxRaw = parseInt(document.getElementById("pl-bpm-max").value);
+  const bpmMin = isNaN(bpmMinRaw) ? null : bpmMinRaw;
+  const bpmMax = isNaN(bpmMaxRaw) ? null : bpmMaxRaw;
 
-  if (bpmMin && bpmMax && bpmMin >= bpmMax) {
+  if (bpmMin !== null && bpmMax !== null && bpmMin >= bpmMax) {
     status.textContent = "BPM min must be less than max.";
     btn.disabled = false;
     return;
+  }
+
+  let bpmRange = null;
+  if (bpmMin !== null || bpmMax !== null) {
+    bpmRange = [bpmMin !== null ? bpmMin : 0, bpmMax !== null ? bpmMax : 9999];
   }
 
   const body = {
     duration_min: parseInt(document.getElementById("pl-duration").value),
     genre_filter: document.getElementById("pl-genre").value || null,
     name:         document.getElementById("pl-name").value.trim() || null,
-    bpm_range:    (bpmMin && bpmMax) ? [bpmMin, bpmMax] : null,
+    bpm_range:    bpmRange,
   };
 
   try {
