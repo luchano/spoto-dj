@@ -181,6 +181,32 @@ class TestAnalyzeTrackFull:
 # Camelot conversion
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestCleanGenreLabels:
+    def test_splits_parent_and_child(self):
+        out = ea._clean_genre_labels(["Electronic---Glitch"])
+        assert out == ["Glitch", "Electronic"]
+
+    def test_subgenres_first_then_parents_deduped(self):
+        out = ea._clean_genre_labels(["Electronic---Glitch", "Electronic---Vaporwave"])
+        assert out == ["Glitch", "Vaporwave", "Electronic"]
+
+    def test_drops_non_music_noise(self):
+        out = ea._clean_genre_labels(["Non-Music---Spoken Word", "Electronic---Techno"])
+        assert out == ["Techno", "Electronic"]
+        assert "Spoken Word" not in out
+
+    def test_case_insensitive_dedup(self):
+        out = ea._clean_genre_labels(["Rock---Rock", "Rock---Indie Rock"])
+        assert out == ["Rock", "Indie Rock"]
+
+    def test_cluster_matchable(self):
+        """The cleaned tags must match playlist_engine genre clusters — the raw
+        'Parent---Child' string matches none."""
+        from playlist_engine import tags_to_clusters
+        assert tags_to_clusters(["Electronic---Glitch"]) == set()
+        assert "electronic" in tags_to_clusters(ea._clean_genre_labels(["Electronic---Glitch"]))
+
+
 class TestKeyToCamelot:
     @pytest.mark.parametrize("key,scale,expected", [
         ("C", "major", "8B"),

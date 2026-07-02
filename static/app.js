@@ -149,8 +149,8 @@ function applyAnalysisResults(results) {
       t.bpm = r.bpm; t.key = r.key; t.camelot = r.camelot; t.energy = r.energy;
       changed = true;
     }
-    // Keep Last.fm track tags in a separate field so Spotify artist genres and
-    // Last.fm track genres can be displayed side by side.
+    // Track-level analyzed genres (essentia in local mode, Last.fm in legacy)
+    // kept separate from Spotify artist genres so both show side by side.
     if (r.track_genres && r.track_genres.length) {
       t.track_genres = r.track_genres;
       changed = true;

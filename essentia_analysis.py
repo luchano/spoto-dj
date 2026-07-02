@@ -418,10 +418,48 @@ def download_models():
         print(f"  → saved to {dest}")
 
 
-def classify_genre(audio_path: Path, top_n: int = 5) -> list:
+# Discogs "Parent" genres too broad to be useful as DJ tags on their own; we
+# still emit them (they help playlist genre-clustering match) but after the
+# specific subgenres.
+_GENRE_NOISE_PARENTS = {"Non-Music", "Stage & Screen", "Brass & Military", "Children's"}
+
+
+def _clean_genre_labels(raw_labels: list) -> list:
+    """
+    Turn raw Discogs-400 labels ("Electronic---Glitch") into clean, readable and
+    cluster-matchable tags.
+
+    "Electronic---Glitch" → parent "Electronic" + subgenre "Glitch". We return
+    subgenres first (most useful for a DJ), then parents, de-duplicated in order.
+    The split also lets playlist_engine.tags_to_clusters() match them — the raw
+    "Parent---Child" string matches no cluster, but "Electronic"/"Glitch" do.
+    Drops non-music / soundtrack noise.
+    """
+    subs, parents = [], []
+    for label in raw_labels:
+        parent, _, child = label.partition("---")
+        if parent in _GENRE_NOISE_PARENTS:
+            continue
+        if child:
+            subs.append(child.strip())
+        if parent:
+            parents.append(parent.strip())
+
+    ordered, seen = [], set()
+    for tag in subs + parents:
+        key = tag.lower()
+        if tag and key not in seen:
+            seen.add(key)
+            ordered.append(tag)
+    return ordered
+
+
+def classify_genre(audio_path: Path, top_n: int = 4) -> list:
     """
     Classify genre using essentia's Discogs-400 model.
-    Returns a list of up to top_n genre strings (e.g. ["Electronic---Techno", …]).
+
+    Returns a de-duplicated list of clean genre tags (e.g. ["Glitch",
+    "Vaporwave", "Electronic"]) derived from the top_n raw predictions.
     Returns [] if models are not downloaded or essentia-tensorflow is not installed.
     """
     effnet_path = MODELS_DIR / _EFFNET_MODEL
@@ -455,7 +493,8 @@ def classify_genre(audio_path: Path, top_n: int = 5) -> list:
         avg = np.mean(predictions, axis=0)
 
         top_indices = np.argsort(avg)[::-1][:top_n]
-        return [DISCOGS400_LABELS[i] for i in top_indices if i < len(DISCOGS400_LABELS)]
+        raw = [DISCOGS400_LABELS[i] for i in top_indices if i < len(DISCOGS400_LABELS)]
+        return _clean_genre_labels(raw)
 
     except Exception as e:
         log.warning("Genre classification failed for %s: %s", audio_path, e)
