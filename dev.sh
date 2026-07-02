@@ -85,12 +85,61 @@ stop() {
   [[ "$stopped" -eq 1 ]] && echo "Stopped." || echo "Not running."
 }
 
+queue_status() {
+  local log="server.log"
+
+  # How many tracks are analyzed (persisted in the cache) and downloaded.
+  local analyzed="?"
+  if [[ -f .audio_cache.json ]]; then
+    analyzed="$(.venv/bin/python -c 'import json;print(len(json.load(open(".audio_cache.json"))))' 2>/dev/null || echo '?')"
+  fi
+  local oggs; oggs="$(find .audio_files -maxdepth 1 -name '*.ogg' 2>/dev/null | wc -l | tr -d ' ')"
+  # Library total ≈ the largest "…: N new tracks" ever logged (the first full
+  # run, before the cache filled up). Max is robust to later small re-runs.
+  local total=""
+  [[ -f "$log" ]] && total="$(grep -oE ': [0-9]+ new tracks' "$log" 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1 || true)"
+
+  echo ""
+  echo "Analysis queue:"
+  echo "  analyzed:     ${analyzed}${total:+ / ${total}} tracks   (${oggs} audio files on disk)"
+
+  # What zotify is downloading right now, and for how long.
+  local zpid; zpid="$(pgrep -f 'venv-dl/bin/zotify' 2>/dev/null | head -1 || true)"
+  if [[ -n "$zpid" ]]; then
+    local info et tid
+    info="$(ps -o etime=,command= -p "$zpid" 2>/dev/null || true)"
+    et="$(echo "$info" | awk '{print $1}')"
+    tid="$(echo "$info" | grep -oE 'track/[A-Za-z0-9]+' | head -1 | cut -d/ -f2 || true)"
+    echo "  downloading:  ${tid:-?}  (elapsed ${et:-?})  — real-time paced, ~track length"
+  else
+    echo "  downloading:  idle (no download in progress)"
+  fi
+
+  # Last track that finished analysis.
+  if [[ -f "$log" ]]; then
+    local last
+    last="$(grep -E "Local analysis OK for" "$log" 2>/dev/null | tail -1 || true)"
+    if [[ -n "$last" ]]; then
+      local ts title bpm
+      ts="$(echo "$last" | awk '{print $2}')"
+      title="$(echo "$last" | sed -E "s/.*OK for '([^']*)'.*/\1/")"
+      bpm="$(echo "$last" | grep -oE 'bpm=[0-9.]+' | head -1 || true)"
+      echo "  last done:    '${title}'  ${bpm}  [${ts}]"
+    fi
+  fi
+}
+
 case "${1:-}" in
   start)   start ;;
   stop)    stop ;;
   restart) stop; start ;;
   status)
-    if is_running; then echo "Running (pid $(cat "$PIDFILE"))  →  $URL";
-    else echo "Not running."; fi ;;
+    if is_running; then
+      echo "Running (pid $(cat "$PIDFILE"))  →  $URL"
+      queue_status
+    else
+      echo "Not running."
+      queue_status   # cache/download counts are still useful when stopped
+    fi ;;
   *) echo "Usage: ./dev.sh {start|stop|restart|status}" >&2; exit 1 ;;
 esac
