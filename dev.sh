@@ -75,7 +75,12 @@ stop() {
     kill -9 "$pid" 2>/dev/null || true
     stopped=1
   fi
-  # Fallback: reap any lingering --reload child still holding the port.
+  # uvicorn --reload spawns a worker child that can outlive its parent (it gets
+  # reparented to launchd and keeps running the analysis + a zotify download).
+  # Reap any such orphaned worker for THIS app, plus a lingering download.
+  if pkill -f "uvicorn main:app" 2>/dev/null; then stopped=1; fi
+  pkill -f "venv-dl/bin/zotify" 2>/dev/null || true
+  # Reap anything still on the port.
   local strays; strays="$(lsof -ti "tcp:${PORT}" 2>/dev/null || true)"
   if [[ -n "$strays" ]]; then
     kill $strays 2>/dev/null || true
