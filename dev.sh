@@ -40,8 +40,11 @@ start() {
     exit 1
   fi
 
+  # No --reload: it spawns a worker child that can orphan (reparent to launchd)
+  # and keep running the analysis after the parent is killed. A single process
+  # means stop is clean. Editing code? re-apply with ./dev.sh restart.
   echo "Starting Spoto DJ dev server on ${URL} …"
-  nohup "$UVICORN" main:app --reload --host "$HOST" --port "$PORT" > "$LOGFILE" 2>&1 &
+  nohup "$UVICORN" main:app --host "$HOST" --port "$PORT" > "$LOGFILE" 2>&1 &
   echo $! > "$PIDFILE"
 
   # Wait until it answers (or dies), up to ~20s.
