@@ -471,7 +471,12 @@ def _clean_genre_labels(raw_labels: list) -> list:
         if child:
             subs.append(child.strip())
         if parent:
-            parents.append(parent.strip())
+            # Discogs compound parents ("Folk, World, & Country", "Funk / Soul")
+            # match no genre cluster as-is — split them into their component
+            # genres so playlist filtering can cluster these tracks.
+            import re
+            parts = [p.strip() for p in re.split(r"[,/&]", parent) if p.strip()]
+            parents.extend(parts if len(parts) > 1 else [parent.strip()])
 
     ordered, seen = [], set()
     for tag in subs + parents:

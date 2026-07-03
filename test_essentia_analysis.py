@@ -261,6 +261,30 @@ class TestCleanGenreLabels:
         assert tags_to_clusters(["Electronic---Glitch"]) == set()
         assert "electronic" in tags_to_clusters(ea._clean_genre_labels(["Electronic---Glitch"]))
 
+    def test_compound_parents_split_into_components(self):
+        assert ea._clean_genre_labels(["Folk, World, & Country---African"]) == \
+            ["African", "Folk", "World", "Country"]
+        assert ea._clean_genre_labels(["Funk / Soul---Boogie"]) == ["Boogie", "Funk", "Soul"]
+
+    def test_every_discogs_label_reaches_a_cluster(self):
+        """End-to-end vocabulary audit: every non-noise Discogs-400 label must
+        land in at least one playlist genre cluster — otherwise genre-filtered
+        DJ sets silently ignore those tracks (the bug behind the empty genre
+        dropdown)."""
+        import json
+        from pathlib import Path
+        from playlist_engine import tags_to_clusters
+        p = Path(".essentia_models") / ea._GENRE_LABELS_JSON
+        if not p.exists():
+            pytest.skip("genre labels JSON not downloaded")
+        classes = json.loads(p.read_text())["classes"]
+        orphans = [
+            label for label in classes
+            if ea._clean_genre_labels([label])
+            and not tags_to_clusters(ea._clean_genre_labels([label]))
+        ]
+        assert orphans == [], f"{len(orphans)} labels match no cluster: {orphans[:8]}"
+
 
 class TestEnergyFromLufs:
     def test_monotonic(self):

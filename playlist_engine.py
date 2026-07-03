@@ -338,9 +338,21 @@ def _normalize_tag(tag: str) -> str:
     return re.sub(r"[^a-z0-9&]", "", tag.lower())
 
 
+def _expand_tag(tag: str) -> list:
+    """Split compound genre tags into their component genres.
+
+    Discogs parent genres arrive as compounds ('Folk, World, & Country',
+    'Funk / Soul') that match no cluster as one token but whose components do.
+    Tags without separators pass through untouched (so 'r&b' stays intact —
+    we only split on ',' and '/', never on '&')."""
+    if "," in tag or "/" in tag:
+        return [p.strip(" &") for p in re.split(r"[,/]", tag) if p.strip(" &")]
+    return [tag]
+
+
 def tags_to_clusters(genres: list) -> set:
     """Every cluster key that any of the given tags belongs to (may be empty)."""
-    norm = {_normalize_tag(g) for g in genres if g}
+    norm = {_normalize_tag(p) for g in genres if g for p in _expand_tag(g)}
     norm.discard("")
     return {
         key for key, _, members in GENRE_CLUSTERS
@@ -356,7 +368,7 @@ def classify_genre(genres: list) -> Optional[str]:
     """
     if not genres:
         return None
-    norm = [_normalize_tag(g) for g in genres]
+    norm = [_normalize_tag(p) for g in genres if g for p in _expand_tag(g)]
     norm = [n for n in norm if n]
     scores = {
         key: sum(1 for n in norm if n in members)

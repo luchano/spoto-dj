@@ -3,6 +3,7 @@ let filtered = [];
 let sortCol = "added_at";
 let sortDir = -1;
 let pollTimer = null;
+let pollCount = 0;
 let canExport = false;          // true when spotify_user_id is available
 let currentPlaylistId = null;   // id of the playlist shown in detail view
 let genreLabels = {};           // cluster value -> human label (from /api/playlists/genres)
@@ -124,6 +125,10 @@ async function pollAnalysis() {
   const pct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 100;
   setBannerMsg(`Analizando… ${data.done} / ${data.total} canciones`, pct);
   setBannerDetail(data.current, data.last_done);
+
+  // Long runs take hours — refresh the DJ-set genre dropdown as clusters
+  // cross the minimum-track threshold, not only at the very end.
+  if (++pollCount % 30 === 0) populateGenreFilter();
 
   if (!data.running && !data.backfilling) {
     clearInterval(pollTimer);
