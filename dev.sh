@@ -13,11 +13,33 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 HOST="${HOST:-127.0.0.1}"
-PORT="${PORT:-8000}"
+
+# Port resolution: env override → PORT in .env → port inside SPOTIFY_REDIRECT_URI
+# in .env → 8000. The Spotify OAuth redirect URI is registered EXACTLY in the
+# Spotify developer dashboard, so the server port and the redirect URI must
+# always move together — deriving both from .env keeps them in sync.
+_env_port=""
+if [[ -z "${PORT:-}" && -f .env ]]; then
+  _env_port="$(grep -E '^PORT=' .env | tail -1 | cut -d= -f2 | tr -d '[:space:]' || true)"
+  if [[ -z "$_env_port" ]]; then
+    _env_port="$(grep -E '^SPOTIFY_REDIRECT_URI=' .env | tail -1 | grep -oE ':[0-9]+/' | tr -d ':/' || true)"
+  fi
+fi
+PORT="${PORT:-${_env_port:-8000}}"
 URL="http://${HOST}:${PORT}"
 PIDFILE=".dev-server.pid"
 LOGFILE=".dev-server.log"
 UVICORN=".venv/bin/uvicorn"
+
+# Warn if the redirect URI in .env points at a DIFFERENT port — Spotify login
+# would redirect the browser to a dead port after auth.
+if [[ -f .env ]]; then
+  _redir_port="$(grep -E '^SPOTIFY_REDIRECT_URI=' .env | tail -1 | grep -oE ':[0-9]+/' | tr -d ':/' || true)"
+  if [[ -n "$_redir_port" && "$_redir_port" != "$PORT" ]]; then
+    echo "WARNING: server port ${PORT} != SPOTIFY_REDIRECT_URI port ${_redir_port} (.env)" >&2
+    echo "         Spotify login will break — align PORT and SPOTIFY_REDIRECT_URI." >&2
+  fi
+fi
 
 is_running() { [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null; }
 
@@ -32,6 +54,14 @@ start() {
     echo "uvicorn not found at $UVICORN — set up the venv first:" >&2
     echo "  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt" >&2
     exit 1
+  fi
+  # A just-stopped server can hold the port for a moment while it dies
+  # (restart race) — wait briefly for it to free before declaring conflict.
+  if lsof -ti "tcp:${PORT}" >/dev/null 2>&1; then
+    for _ in $(seq 1 16); do
+      lsof -ti "tcp:${PORT}" >/dev/null 2>&1 || break
+      sleep 0.25
+    done
   fi
   if lsof -ti "tcp:${PORT}" >/dev/null 2>&1; then
     echo "Port ${PORT} is already in use by another process:" >&2
@@ -54,6 +84,7 @@ start() {
       echo "  Ready →  $URL"
       echo ""
       echo "  logs:  tail -f $LOGFILE   ·   stop:  ./dev.sh stop"
+      command -v open >/dev/null 2>&1 && open "$URL"   # pop the web UI (macOS)
       return 0
     fi
     if ! is_running; then
