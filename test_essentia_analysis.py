@@ -148,6 +148,27 @@ class TestDownloadTrack:
 # analyze_track_full
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestDownloadTimeout:
+    def test_short_track_uses_floor(self, monkeypatch):
+        monkeypatch.setattr(ea, "ZOTIFY_RATE_LIMITER", "0.35")
+        assert ea._download_timeout(240_000) == ea.ZOTIFY_TIMEOUT  # 4-min track
+
+    def test_45min_track_gets_enough_time(self, monkeypatch):
+        """LCD Soundsystem's '45:33' (45.5 min) at rate 0.35 needs ~16 min of
+        download; the old fixed 900 s cap killed it on every run."""
+        monkeypatch.setattr(ea, "ZOTIFY_RATE_LIMITER", "0.35")
+        t = ea._download_timeout(45 * 60 * 1000 + 33_000)
+        assert t > (45 * 60 + 33) * 0.35        # more than the expected time
+        assert t >= 1500                          # comfortably above 900
+
+    def test_unknown_duration_uses_floor(self):
+        assert ea._download_timeout(0) == ea.ZOTIFY_TIMEOUT
+
+    def test_bad_rate_limiter_string_does_not_crash(self, monkeypatch):
+        monkeypatch.setattr(ea, "ZOTIFY_RATE_LIMITER", "not-a-number")
+        assert ea._download_timeout(300_000) >= ea.ZOTIFY_TIMEOUT
+
+
 class TestAnalyzeTrackFull:
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)

@@ -752,30 +752,39 @@ def generate(
             if not avail:
                 continue
 
-            # Domain reduction: arc/energy/popularity windows, relaxing wide.
-            cands = _filter_for_slot(avail, slot, prev, 0,  0)
-            if not cands:
-                cands = _filter_for_slot(avail, slot, prev, 10, 15)
-            if not cands:
-                cands = _filter_for_slot(avail, slot, prev, 20, 30)
-            if not cands:
-                cands = avail
-
-            # Hard adjacency gate, then emergency relax, then labeled reset.
-            transition = "beatmatch"
-            if prev is not None:
-                gated = [t for t in cands
-                         if tempo_distance_pct(prev["bpm"], t["bpm"]) <= TRANSITION_HARD_PCT]
-                if not gated:
-                    gated = [t for t in cands
-                             if tempo_distance_pct(prev["bpm"], t["bpm"]) <= TRANSITION_RELAX_PCT]
-                    transition = "stretch"
-                if not gated:
+            # Candidate selection: ADJACENCY OUTRANKS THE NARRATIVE WINDOWS.
+            # A beatmatchable track outside the section's energy window always
+            # beats an unmixable track inside it — the energy misfit is only a
+            # score penalty, never a reason to break the tempo chain. So the
+            # adjacency gate is applied at every window-relaxation level,
+            # including a final no-windows level, before we even consider
+            # stretching (≤8%) and only then a labeled reset.
+            _ladders = (
+                _filter_for_slot(avail, slot, prev, 0,  0),
+                _filter_for_slot(avail, slot, prev, 10, 15),
+                _filter_for_slot(avail, slot, prev, 20, 30),
+                avail,
+            )
+            transition, cands = "beatmatch", []
+            if prev is None:
+                cands = next((l for l in _ladders if l), avail)
+                transition = "open"
+            else:
+                for pct_gate, label in ((TRANSITION_HARD_PCT, "beatmatch"),
+                                        (TRANSITION_RELAX_PCT, "stretch")):
+                    for level in _ladders:
+                        gated = [t for t in level
+                                 if tempo_distance_pct(prev["bpm"], t["bpm"]) <= pct_gate]
+                        if gated:
+                            cands, transition = gated, label
+                            break
+                    if cands:
+                        break
+                if not cands:
                     if state["resets"] >= MAX_RESETS_PER_SET:
                         continue   # this beam can't afford another reset — dies
-                    gated = cands
+                    cands = next((l for l in _ladders if l), avail)
                     transition = "reset"
-                cands = gated
 
             recent = _recent_artists(state["tracks"])
             scored = sorted(

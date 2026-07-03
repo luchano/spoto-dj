@@ -144,6 +144,7 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
             artists=track.get("artists", ""),
             semaphore=local_sem,
             on_stage=_on_stage,
+            duration_ms=track.get("duration_ms", 0),
         )
 
     async def _lookup(track: dict):

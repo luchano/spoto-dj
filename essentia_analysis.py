@@ -186,7 +186,27 @@ def build_zotify_command(spotify_url: str) -> list:
     ]
 
 
-def download_track(spotify_url: str, track_id: str) -> Optional[Path]:
+def _download_timeout(duration_ms: int) -> int:
+    """
+    Per-track download timeout, aware of real-time pacing.
+
+    With --download-rate-limiter R, a track takes ≈ duration × R to download,
+    so a fixed timeout kills long tracks forever: LCD Soundsystem's "45:33"
+    (45.5 min) at R=0.35 needs ~16 min but the old fixed 900 s cap killed it
+    at 15 — on every single run. Scale the cap with the expected download
+    time (+50% headroom +3 min slack), floored at ZOTIFY_TIMEOUT.
+    """
+    if duration_ms <= 0:
+        return ZOTIFY_TIMEOUT
+    try:
+        rate = float(ZOTIFY_RATE_LIMITER)
+    except ValueError:
+        rate = 1.0
+    expected = (duration_ms / 1000.0) * max(rate, 0.1)
+    return max(ZOTIFY_TIMEOUT, int(expected * 1.5 + 180))
+
+
+def download_track(spotify_url: str, track_id: str, duration_ms: int = 0) -> Optional[Path]:
     """
     Download a track's audio directly from Spotify via zotify (subprocess).
 
@@ -225,17 +245,18 @@ def download_track(spotify_url: str, track_id: str) -> Optional[Path]:
         return None
 
     cmd = build_zotify_command(spotify_url)
-    log.info("Downloading %s via zotify …", track_id)
+    timeout = _download_timeout(duration_ms)
+    log.info("Downloading %s via zotify (timeout %ss)…", track_id, timeout)
     try:
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
-            timeout=ZOTIFY_TIMEOUT,
+            timeout=timeout,
             stdin=subprocess.DEVNULL,  # never let it block on interactive input
         )
     except subprocess.TimeoutExpired:
-        log.warning("zotify timed out (>%ss) for %s", ZOTIFY_TIMEOUT, track_id)
+        log.warning("zotify timed out (>%ss) for %s", timeout, track_id)
         return None
     except OSError as e:
         log.error("could not run zotify (%s): %s", ZOTIFY_BIN, e)
@@ -554,6 +575,7 @@ async def analyze_track_full(
     semaphore: asyncio.Semaphore,
     skip_genre: bool = False,
     on_stage=None,
+    duration_ms: int = 0,
 ) -> tuple:
     """
     Download + analyze a track. Returns (track_id, result_dict).
@@ -586,7 +608,7 @@ async def analyze_track_full(
         # Download
         _stage("downloading")
         audio_path = await loop.run_in_executor(
-            None, download_track, spotify_url, track_id,
+            None, download_track, spotify_url, track_id, duration_ms,
         )
         if not audio_path:
             return track_id, {"error": f"audio download failed for '{title}'"}
