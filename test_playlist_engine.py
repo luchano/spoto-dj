@@ -521,6 +521,84 @@ class TestScoreCandidate:
 # Core generator
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestTempoPrimitives:
+    def test_tempo_distance_pct_same(self):
+        from playlist_engine import tempo_distance_pct
+        assert tempo_distance_pct(120, 120) == 0.0
+
+    def test_tempo_distance_pct_octave_equivalence(self):
+        """128→64 beatmatches cleanly (half-time mix) — distance must be ~0."""
+        from playlist_engine import tempo_distance_pct
+        assert tempo_distance_pct(128, 64) < 0.01
+        assert tempo_distance_pct(64, 128) < 0.01
+
+    def test_transition_smoothness_asymmetry(self):
+        """Slow-downs are more uncomfortable than speed-ups (Ishizaki)."""
+        from playlist_engine import transition_smoothness
+        assert transition_smoothness(120, 124) > transition_smoothness(120, 116)
+
+    def test_harmonic_score_tiers(self):
+        from playlist_engine import harmonic_score
+        assert harmonic_score("8A", "8A") == 1.0
+        assert harmonic_score("8A", "9A") == 0.8   # +1 same letter
+        assert harmonic_score("8A", "8B") == 0.8   # letter swap
+        assert harmonic_score("8A", "10A") == 0.5  # +2 energy boost
+        assert harmonic_score("8A", "3B") == 0.0
+
+
+class TestTrajectory:
+    def test_slot_targets_are_gradual(self):
+        """Consecutive slot BPM targets must creep (≤3%) on the way up — the
+        interpolated trajectory is what prevents cliff-edge section jumps.
+        The final wind-down after the climax may descend faster (≤8%), which
+        the beam search resolves as a stretch/labeled-reset end-of-set move."""
+        for n in (12, 16, 24):
+            slots = distribute_sections(n, 120)
+            targets = [s.bpm_target for s in slots]
+            peak_idx = targets.index(max(targets))
+            for i, (a, b) in enumerate(zip(slots, slots[1:])):
+                delta_pct = abs(b.bpm_target - a.bpm_target) / a.bpm_target
+                limit = 0.03 if i < peak_idx else 0.08
+                assert delta_pct <= limit, \
+                    f"slots {a.position}->{b.position}: {a.bpm_target}->{b.bpm_target}"
+
+    def test_total_range_bounded(self):
+        """Tempo arc spread should stay within DJ practice (~10-15% of base)."""
+        slots = distribute_sections(16, 120)
+        targets = [s.bpm_target for s in slots]
+        assert max(targets) - min(targets) <= 120 * 0.15
+
+
+class TestTransitionGuarantees:
+    def setup_method(self):
+        self.library = _make_library(60)
+        self.cache   = _make_cache(self.library)
+
+    def test_unlabeled_transitions_are_mixable(self):
+        """Every transition NOT labeled 'reset' must be ≤8% tempo distance —
+        the hard adjacency gate of the beam search."""
+        from playlist_engine import tempo_distance_pct
+        r = generate(self.library, self.cache, duration_min=60)
+        tracks = r["tracks"]
+        for a, b in zip(tracks, tracks[1:]):
+            if b.get("transition") == "reset":
+                continue
+            assert tempo_distance_pct(a["bpm"], b["bpm"]) <= 0.081, \
+                f"{a['bpm']}→{b['bpm']} unlabeled but not mixable"
+
+    def test_reset_budget(self):
+        r = generate(self.library, self.cache, duration_min=90)
+        resets = [t.get("transition") for t in r["tracks"]].count("reset")
+        assert resets <= 1
+
+    def test_transitions_labeled(self):
+        r = generate(self.library, self.cache, duration_min=40)
+        tracks = r["tracks"]
+        assert tracks[0].get("transition") == "open"
+        for t in tracks[1:]:
+            assert t.get("transition") in ("beatmatch", "stretch", "reset")
+
+
 class TestGenerate:
     def setup_method(self):
         self.library = _make_library(40)
@@ -655,7 +733,10 @@ class TestPersistence:
         result = generate(lib, cache, duration_min=30)
         pl = create_playlist(result, {"energy_profile": "peak_time"}, name="My Set")
         assert pl["id"] in load_playlists()
-        assert load_playlists()[pl["id"]]["name"] == "My Set"
+        # `name` is a prefix: "My Set · 30min · <bpm range> · <Mon DD>"
+        stored = load_playlists()[pl["id"]]["name"]
+        assert stored.startswith("My Set")
+        assert "30min" in stored
 
     def test_create_playlist_includes_section_info(self):
         lib    = _make_library(25)
@@ -684,7 +765,8 @@ class TestPersistence:
     def test_create_playlist_auto_name_without_bpm_range(self):
         lib = _make_library(25); cache = _make_cache(lib)
         pl  = create_playlist(generate(lib, cache, duration_min=30), {})
-        assert "DJ Set" in pl["name"]
+        # Auto-name: "<duration>min · <derived bpm range> · <Mon DD>"
+        assert "30min" in pl["name"]
 
     def test_delete_playlist(self):
         lib = _make_library(25); cache = _make_cache(lib)

@@ -151,15 +151,19 @@ class SectionSlot:
 # Universal 7-section narrative arc (weights sum to 1.0).
 # BPM targets are derived at runtime from the user's bpm_range,
 # not hardcoded per profile.
+# BPM factors follow DJ practice: the tempo arc climbs gently (~10-15 BPM net
+# per hour, "BPM creep") and the mid-set valley is expressed through ENERGY,
+# not through a tempo dive — "a BPM jump is a genre change, not an energy
+# change". Energy ranges carve the narrative; tempo stays mixable throughout.
 UNIVERSAL_SECTIONS: List[SectionDef] = [
     #              name           label          emoji  wt    emin emax bfactor pmin pmax
-    SectionDef("intro",       "Intro",       "🎵", 0.12, 25,  50, 0.92,  0,  70),
+    SectionDef("intro",       "Intro",       "🎵", 0.12, 25,  50, 0.94,  0,  70),
     SectionDef("build",       "Build",       "📈", 0.18, 45,  70, 0.97,  0,  85),
-    SectionDef("peak_a",      "First Peak",  "🔥", 0.12, 70,  90, 1.02, 55, 100),
-    SectionDef("mid_journey", "Journey",     "🌊", 0.18, 50,  68, 0.95,  0,  75),
+    SectionDef("peak_a",      "First Peak",  "🔥", 0.12, 70,  90, 1.00, 55, 100),
+    SectionDef("mid_journey", "Journey",     "🌊", 0.18, 50,  68, 0.98,  0,  75),
     SectionDef("escalation",  "Rise",        "⬆",  0.18, 65,  88, 1.02,  0,  90),
-    SectionDef("climax",      "Climax",      "💥", 0.12, 82, 100, 1.07, 60, 100),
-    SectionDef("outro",       "Outro",       "🌅", 0.10, 35,  62, 0.93,  0,  70),
+    SectionDef("climax",      "Climax",      "💥", 0.12, 82, 100, 1.05, 60, 100),
+    SectionDef("outro",       "Outro",       "🌅", 0.10, 35,  62, 0.97,  0,  70),
 ]
 
 
@@ -199,29 +203,55 @@ def distribute_sections(
     for i, _ in fracs[:remainder]:
         counts[i] += 1
 
+    # ── Piecewise-linear BPM/energy trajectory across ALL slots ─────────────
+    # Flat per-section targets produce cliff-edge jumps at section boundaries
+    # (the "127→108" problem). Instead, each section anchors its target at its
+    # midpoint slot and every slot interpolates between neighboring anchors,
+    # so consecutive slot targets never differ by more than a couple of BPM —
+    # the "BPM creep" DJs actually use.
+    anchors = []   # (midpoint_position, anchor_bpm, anchor_energy)
+    pos_cursor = 0
+    for sec_def, count in zip(defs, counts):
+        if count == 0:
+            continue
+        raw_bpm  = base_bpm * sec_def.bpm_factor
+        anchor_b = max(bpm_lo, min(bpm_hi, max(60.0, raw_bpm)))
+        anchor_e = (sec_def.energy_min + sec_def.energy_max) / 200.0
+        anchors.append((pos_cursor + (count - 1) / 2.0, anchor_b, anchor_e))
+        pos_cursor += count
+
+    def _interp(p: float) -> Tuple[float, float]:
+        if p <= anchors[0][0]:
+            return anchors[0][1], anchors[0][2]
+        if p >= anchors[-1][0]:
+            return anchors[-1][1], anchors[-1][2]
+        for (p0, b0, e0), (p1, b1, e1) in zip(anchors, anchors[1:]):
+            if p0 <= p <= p1:
+                t = (p - p0) / (p1 - p0) if p1 > p0 else 0.0
+                return b0 + t * (b1 - b0), e0 + t * (e1 - e0)
+        return anchors[-1][1], anchors[-1][2]
+
     slots: List[SectionSlot] = []
     pos = 0
     for sec_def, count in zip(defs, counts):
         if count == 0:
             continue
-        raw_bpm = round(base_bpm * sec_def.bpm_factor)
-        bpm_t   = max(bpm_lo, min(bpm_hi, max(60, raw_bpm)))
-        target_e = (sec_def.energy_min + sec_def.energy_max) / 200.0
 
         for j in range(count):
             is_hit = (
                 (sec_def.name == "peak_a" and j == count - 1) or
                 (sec_def.name == "climax" and j <= 1)
             )
+            bpm_t, target_e = _interp(float(pos))
             slots.append(SectionSlot(
                 section_name  = sec_def.name,
                 label         = sec_def.label,
                 emoji         = sec_def.emoji,
                 position      = pos,
-                bpm_target    = bpm_t,
+                bpm_target    = round(bpm_t),
                 energy_min    = sec_def.energy_min,
                 energy_max    = sec_def.energy_max,
-                target_energy = target_e,
+                target_energy = round(target_e, 4),
                 pop_min       = sec_def.pop_min,
                 pop_max       = sec_def.pop_max,
                 is_hit_slot   = is_hit,
@@ -457,31 +487,99 @@ def build_pool(library: list, cache: dict) -> list:
 # Scoring
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ── Tempo / transition primitives ────────────────────────────────────────────
+# Grounded in DJ practice research: adjacent beatmatched tracks should differ
+# by ~1-3 BPM ideally, ≤6% hard cap (pitch faders default ±6-10%, keylock
+# artifacts appear past ~5-6%). Rules are PERCENT-based, never absolute BPM.
+
+TRANSITION_HARD_PCT  = 0.06   # normal adjacency ceiling (~7.5 BPM at 125)
+TRANSITION_RELAX_PCT = 0.08   # emergency ceiling before flagging a reset
+MAX_RESETS_PER_SET   = 1      # big-jump "events" allowed per set (labeled)
+
+
+def tempo_distance_pct(bpm_a: float, bpm_b: float) -> float:
+    """Relative tempo distance between two tracks, octave-normalized.
+
+    Half/double-time mixing keeps beats aligned (128→64 beatmatches cleanly),
+    so 2:1 ratios count as close. Returns a fraction (0.05 == 5%)."""
+    if bpm_a <= 0 or bpm_b <= 0:
+        return 9.99
+    best = 9.99
+    for mult in (0.5, 1.0, 2.0):
+        hi = max(bpm_a, bpm_b * mult)
+        lo = min(bpm_a, bpm_b * mult)
+        best = min(best, hi / lo - 1.0)
+    return best
+
+
+def transition_smoothness(prev_bpm: float, next_bpm: float) -> float:
+    """0-1 score for how beatmatchable a transition is.
+
+    Uses Ishizaki et al.'s asymmetric discomfort weighting: listeners tolerate
+    speeding up slightly more than slowing down (a=0.765 up, b=1.0 down)."""
+    if prev_bpm <= 0 or next_bpm <= 0:
+        return 0.7   # unknown — neutral-ish
+    # Fold octaves first so 128→64 counts as a perfect ratio.
+    f_candidates = (next_bpm / prev_bpm, next_bpm * 2 / prev_bpm, next_bpm / 2 / prev_bpm)
+    f = min(f_candidates, key=lambda r: abs(r - 1.0))
+    discomfort = (f - 1.0) * 0.765 if f >= 1.0 else (1.0 / f - 1.0) * 1.0
+    return max(0.0, 1.0 - discomfort / TRANSITION_HARD_PCT)
+
+
+def harmonic_score(key_from: str, key_to: str) -> float:
+    """Camelot compatibility per DJ practice (Mixed In Key tiers).
+
+    1.0 same key · 0.8 the "four great options" (±1 same letter, letter swap)
+    · 0.5 +2 steps (whole-tone energy boost, use sparingly) · 0.4 unknown
+    · 0.0 incompatible."""
+    if not key_from or not key_to or "?" in (key_from, key_to):
+        return 0.4
+    if key_from == key_to:
+        return 1.0
+    try:
+        num_f, let_f = int(key_from[:-1]), key_from[-1].upper()
+        num_t, let_t = int(key_to[:-1]), key_to[-1].upper()
+    except (ValueError, IndexError):
+        return 0.4
+    if let_f == let_t and (num_t - num_f) % 12 in (1, 11):
+        return 0.8
+    if num_f == num_t and let_f != let_t:
+        return 0.8
+    if let_f == let_t and (num_t - num_f) % 12 == 2:
+        return 0.5
+    return 0.0
+
+
 def score_candidate(
     candidate: dict,
     prev: Optional[dict],
-    target_energy: float,   # normalised 0-1 (section midpoint)
-    bpm_target: int,        # absolute BPM target for this section slot
+    target_energy: float,   # normalised 0-1 (interpolated slot target)
+    bpm_target: int,        # absolute BPM target for this slot (interpolated)
     is_hit_slot: bool,
     recent_artists: set,    # lowercase artist names from last 2 tracks
 ) -> float:
-    """Score a candidate for its section slot. Higher = better fit."""
+    """Score a candidate for a slot. Higher = better fit.
 
-    # Energy match to section midpoint
-    e_norm       = candidate["energy"] / 100.0
-    energy_score = max(0.0, 1.0 - abs(e_norm - target_energy) / 0.4)
+    Weighting follows the playlist-sequencing literature (Bittner/Spotify,
+    Pauws, hpDJ): transition smoothness DOMINATES, the arc (slot target) comes
+    second, harmony third — adjacency is additionally enforced as a hard gate
+    upstream in the beam search, so scoring only ranks feasible options."""
 
-    # BPM: blend transition smoothness AND on-target accuracy
     bpm_c = candidate["bpm"]
-    if prev and prev["bpm"] > 0 and bpm_c > 0:
-        smooth = max(0.0, 1.0 - abs(prev["bpm"] - bpm_c) / 10.0)
-    else:
-        smooth = 0.5
-    on_target = max(0.0, 1.0 - abs(bpm_target - bpm_c) / 15.0)
-    bpm_score = smooth * 0.5 + on_target * 0.5
 
-    # Harmonic compatibility
-    key_s = camelot_score(prev["camelot"] if prev else "?", candidate["camelot"])
+    # Transition smoothness vs the actual previous track (chains across
+    # section boundaries — a boundary transition is still a transition).
+    smooth = transition_smoothness(prev["bpm"], bpm_c) if prev else 0.7
+
+    # Arc fit: proximity to this slot's interpolated trajectory target.
+    arc = max(0.0, 1.0 - tempo_distance_pct(bpm_c, bpm_target) / TRANSITION_RELAX_PCT)
+
+    # Harmonic compatibility with the previous track.
+    key_s = harmonic_score(prev["camelot"] if prev else "?", candidate["camelot"])
+
+    # Energy proximity to the interpolated slot energy target.
+    e_norm       = candidate["energy"] / 100.0
+    energy_score = max(0.0, 1.0 - abs(e_norm - target_energy) / 0.35)
 
     # Hit factor (popularity bonus at designated hit slots)
     hit_s = (candidate["popularity"] / 100.0) if is_hit_slot else 0.0
@@ -492,10 +590,11 @@ def score_candidate(
     ) else 0.0
 
     raw = (
-        key_s        * 0.35 +
-        energy_score * 0.25 +
-        bpm_score    * 0.25 +
-        hit_s        * 0.15
+        smooth       * 0.35 +
+        arc          * 0.25 +
+        key_s        * 0.20 +
+        energy_score * 0.15 +
+        hit_s        * 0.05
     ) - artist_penalty
 
     return max(0.0, raw)
@@ -511,16 +610,20 @@ def _filter_for_slot(
     prev: Optional[dict],
     energy_tol: int = 0,
     pop_tol: int    = 0,
-    bpm_tol: int    = 12,
 ) -> list:
-    """Hard-filter candidates to match a section slot's constraints."""
+    """Hard-filter candidates to a slot's arc window (domain reduction).
+
+    BPM proximity to the slot's trajectory target is percent-based and widens
+    with the energy/popularity tolerances (8% → 12% → 20%). Adjacency to the
+    previous track is enforced separately in the beam search."""
+    bpm_pct = 0.08 + (0.12 if energy_tol >= 20 else 0.04 if energy_tol >= 10 else 0.0)
     result = []
     for t in candidates:
         if not (slot.energy_min - energy_tol <= t["energy"] <= slot.energy_max + energy_tol):
             continue
         if not (slot.pop_min - pop_tol <= t["popularity"] <= slot.pop_max + pop_tol):
             continue
-        if abs(t["bpm"] - slot.bpm_target) > bpm_tol:
+        if tempo_distance_pct(t["bpm"], slot.bpm_target) > bpm_pct:
             continue
         result.append(t)
     return result
@@ -622,43 +725,107 @@ def generate(
     base_bpm = compute_base_bpm(pool, bpm_range)
     slots    = distribute_sections(n_tracks, base_bpm, bpm_range)
 
-    # ── Greedy section-by-section selection ─────────────────────────────────
-    selected: List[dict]  = []
-    used_ids: set         = set()
-    recent_artists: set   = set()
+    # ── Beam-search selection over the slot trajectory ───────────────────────
+    # Greedy pickers dead-end (they burn scarce "bridge" tracks and leave slots
+    # with nothing beatmatchable) and oscillate around per-slot targets. Beam
+    # search keeps BEAM_WIDTH partial sets alive so a locally-tempting pick
+    # that wrecks later transitions gets outcompeted.
+    #
+    # Adjacency is a HARD GATE, not a score: candidates further than
+    # TRANSITION_HARD_PCT (6%) from the previous track are rejected, relaxing
+    # to 8%; beyond that the transition is only allowed as a labeled "reset"
+    # event (budget: MAX_RESETS_PER_SET), matching how real DJs treat big
+    # tempo jumps (breakdown swaps / dead stops — deliberate, rare, marked).
+    BEAM_WIDTH   = 12
+    BRANCH_LIMIT = 6    # top-scored expansions kept per beam state
+
+    def _recent_artists(tracks: list) -> set:
+        return {a.lower() for tr in tracks[-2:] for a in tr["artists_list"]}
+
+    beams = [{"tracks": [], "used": frozenset(), "score": 0.0, "resets": 0}]
 
     for slot in slots:
-        prev        = selected[-1] if selected else None
-        available   = [t for t in pool if t["id"] not in used_ids]
-        if not available:
-            break
+        expansions = []
+        for state in beams:
+            prev  = state["tracks"][-1] if state["tracks"] else None
+            avail = [t for t in pool if t["id"] not in state["used"]]
+            if not avail:
+                continue
 
-        # Progressive constraint relaxation
-        candidates = _filter_for_slot(available, slot, prev, 0,  0, 12)
-        if not candidates:
-            candidates = _filter_for_slot(available, slot, prev, 10, 15, 20)
-        if not candidates:
-            candidates = _filter_for_slot(available, slot, prev, 20, 30, 35)
-        if not candidates:
-            candidates = available  # last resort — no hard constraints
+            # Domain reduction: arc/energy/popularity windows, relaxing wide.
+            cands = _filter_for_slot(avail, slot, prev, 0,  0)
+            if not cands:
+                cands = _filter_for_slot(avail, slot, prev, 10, 15)
+            if not cands:
+                cands = _filter_for_slot(avail, slot, prev, 20, 30)
+            if not cands:
+                cands = avail
 
-        best = max(candidates, key=lambda t: score_candidate(
-            t, prev, slot.target_energy, slot.bpm_target, slot.is_hit_slot, recent_artists,
-        ))
+            # Hard adjacency gate, then emergency relax, then labeled reset.
+            transition = "beatmatch"
+            if prev is not None:
+                gated = [t for t in cands
+                         if tempo_distance_pct(prev["bpm"], t["bpm"]) <= TRANSITION_HARD_PCT]
+                if not gated:
+                    gated = [t for t in cands
+                             if tempo_distance_pct(prev["bpm"], t["bpm"]) <= TRANSITION_RELAX_PCT]
+                    transition = "stretch"
+                if not gated:
+                    if state["resets"] >= MAX_RESETS_PER_SET:
+                        continue   # this beam can't afford another reset — dies
+                    gated = cands
+                    transition = "reset"
+                cands = gated
 
-        selected.append({
-            **best,
-            "section":       slot.section_name,
-            "section_label": slot.label,
-            "section_emoji": slot.emoji,
-            "position":      slot.position + 1,   # 1-indexed for display
-        })
-        used_ids.add(best["id"])
-        recent_artists = {
-            a.lower()
-            for track in selected[-2:]
-            for a in track["artists_list"]
-        }
+            recent = _recent_artists(state["tracks"])
+            scored = sorted(
+                cands,
+                key=lambda t: score_candidate(
+                    t, prev, slot.target_energy, slot.bpm_target,
+                    slot.is_hit_slot, recent,
+                ),
+                reverse=True,
+            )[:BRANCH_LIMIT]
+
+            for t in scored:
+                s = score_candidate(t, prev, slot.target_energy, slot.bpm_target,
+                                    slot.is_hit_slot, recent)
+                # Resets are a last resort: make them expensive so a beam only
+                # keeps one when every alternative path truly dead-ends.
+                if transition == "reset":
+                    s -= 0.6
+                elif transition == "stretch":
+                    s -= 0.15
+                expansions.append({
+                    "tracks": state["tracks"] + [{
+                        **t,
+                        "section":       slot.section_name,
+                        "section_label": slot.label,
+                        "section_emoji": slot.emoji,
+                        "position":      slot.position + 1,   # 1-indexed
+                        "transition":    transition if prev is not None else "open",
+                    }],
+                    "used":   state["used"] | {t["id"]},
+                    "score":  state["score"] + s,
+                    "resets": state["resets"] + (1 if transition == "reset" else 0),
+                })
+
+        if not expansions:
+            break   # pool exhausted for every beam — set ends shorter
+
+        # Keep the best beams, de-duplicated by (used set, last track).
+        expansions.sort(key=lambda st: st["score"], reverse=True)
+        seen_keys, beams = set(), []
+        for st in expansions:
+            key = (st["used"], st["tracks"][-1]["id"])
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            beams.append(st)
+            if len(beams) >= BEAM_WIDTH:
+                break
+
+    selected = beams[0]["tracks"] if beams else []
 
     # ── Duration ──────────────────────────────────────────────────────────────
     overlap_ms = max(0, len(selected) - 1) * 15_000
