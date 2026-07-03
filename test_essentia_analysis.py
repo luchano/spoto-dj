@@ -148,6 +148,56 @@ class TestDownloadTrack:
 # analyze_track_full
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestBanRiskWatchdog:
+    @pytest.fixture(autouse=True)
+    def reset_state(self, monkeypatch):
+        monkeypatch.setattr(ea, "_rate_state", {"level": 0, "signals": 0})
+        monkeypatch.setattr(ea, "ZOTIFY_RATE_LIMITER", "0.1")
+
+    def test_no_signal_keeps_base(self):
+        ea._check_ban_signals("Downloaded 'Song' in 24s", "t1")
+        assert ea.current_rate_limiter() == "0.1"
+        assert ea._rate_state["signals"] == 0
+
+    def test_audio_key_escalates_to_035(self):
+        ea._check_ban_signals("Failed fetching audio key! MAY BE CAUSED BY RATE LIMITS", "t1")
+        assert ea.current_rate_limiter() == "0.35"
+
+    def test_second_signal_escalates_to_1(self):
+        ea._check_ban_signals("Failed fetching audio key!", "t1")
+        ea._check_ban_signals("API_ERROR 429", "t2")
+        assert ea.current_rate_limiter() == "1"
+        assert ea._rate_state["signals"] == 2
+
+    def test_third_signal_stays_at_max(self):
+        for i in range(3):
+            ea._check_ban_signals("too many requests", f"t{i}")
+        assert ea.current_rate_limiter() == "1"
+
+    def test_never_faster_than_base(self, monkeypatch):
+        """If the .env base is SLOWER than an escalation tier, keep the base."""
+        monkeypatch.setattr(ea, "ZOTIFY_RATE_LIMITER", "1.0")
+        ea._check_ban_signals("audio key denial", "t1")
+        assert float(ea.current_rate_limiter()) >= 1.0
+
+    def test_429_in_file_size_is_not_a_signal(self):
+        ea._check_ban_signals("downloaded 14290KB at 4290KB/s", "t1")
+        assert ea._rate_state["signals"] == 0
+
+    def test_command_uses_effective_rate(self):
+        ea._check_ban_signals("rate limit hit", "t1")
+        cmd = ea.build_zotify_command("https://open.spotify.com/track/x")
+        assert cmd[cmd.index("--download-rate-limiter") + 1] == "0.35"
+
+    def test_info_snapshot(self):
+        ea._check_ban_signals("audio key", "t1")
+        info = ea.rate_limiter_info()
+        assert info["base"] == "0.1"
+        assert info["effective"] == "0.35"
+        assert info["escalation_level"] == 1
+        assert info["signals"] == 1
+
+
 class TestDownloadTimeout:
     def test_short_track_uses_floor(self, monkeypatch):
         monkeypatch.setattr(ea, "ZOTIFY_RATE_LIMITER", "0.35")

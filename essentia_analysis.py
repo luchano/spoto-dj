@@ -66,6 +66,70 @@ ZOTIFY_CREDENTIALS = Path(
 # recommended setting for bulk library runs). 0 disables pacing.
 ZOTIFY_RATE_LIMITER = os.getenv("ZOTIFY_RATE_LIMITER", "1.0")
 
+# ── Ban-risk watchdog ────────────────────────────────────────────────────────
+# Spotify's practical rate limit surfaces as audio-key request denials in
+# zotify's output ("Failed fetching audio key", API_ERROR 429). When we see
+# one, we slow down automatically: base rate → 0.35 on the first signal, and
+# → 1.0 (full real-time pacing) if signals keep appearing at 0.35. Escalations
+# stick for the server's lifetime (a restart resets to the .env base) and are
+# logged loudly. The effective rate never goes FASTER than the .env base.
+_ESCALATION_RATES = (0.35, 1.0)
+_rate_state = {"level": 0, "signals": 0}
+
+_BAN_RISK_RE = None  # compiled lazily
+
+
+def current_rate_limiter() -> str:
+    """Effective --download-rate-limiter value, including watchdog escalation."""
+    try:
+        base = float(ZOTIFY_RATE_LIMITER)
+    except ValueError:
+        base = 1.0
+    level = _rate_state["level"]
+    if level <= 0:
+        return ZOTIFY_RATE_LIMITER
+    effective = max(base, _ESCALATION_RATES[min(level, len(_ESCALATION_RATES)) - 1])
+    return f"{effective:g}"
+
+
+def rate_limiter_info() -> dict:
+    """Status snapshot for the UI/status endpoint."""
+    return {
+        "base": ZOTIFY_RATE_LIMITER,
+        "effective": current_rate_limiter(),
+        "escalation_level": _rate_state["level"],
+        "signals": _rate_state["signals"],
+    }
+
+
+def _check_ban_signals(output: str, track_id: str) -> None:
+    """Scan zotify's output for rate-limit / ban-risk markers and escalate."""
+    global _BAN_RISK_RE
+    if not output:
+        return
+    if _BAN_RISK_RE is None:
+        import re
+        _BAN_RISK_RE = re.compile(
+            r"(?i)(audio[ _-]?key|rate ?limit|too many requests|\b429\b)"
+        )
+    match = _BAN_RISK_RE.search(output)
+    if not match:
+        return
+    _rate_state["signals"] += 1
+    old = current_rate_limiter()
+    if _rate_state["level"] < len(_ESCALATION_RATES):
+        _rate_state["level"] += 1
+        log.warning(
+            "BAN-RISK signal in zotify output for %s (marker %r, signal #%d) — "
+            "rate limiter escalated %s → %s",
+            track_id, match.group(0), _rate_state["signals"], old, current_rate_limiter(),
+        )
+    else:
+        log.warning(
+            "BAN-RISK signal for %s (marker %r, signal #%d) — already at max pacing %s",
+            track_id, match.group(0), _rate_state["signals"], old,
+        )
+
 # Max seconds to wait for one track download. Real-time pacing means a track
 # takes roughly its own duration to download, so allow generous headroom.
 ZOTIFY_TIMEOUT = int(os.getenv("ZOTIFY_TIMEOUT", "900"))
@@ -177,7 +241,7 @@ def build_zotify_command(spotify_url: str) -> list:
         "--md-disc-track-totals", "False",        # extra API call per track — skip
         "--disable-song-archive", "True",
         "--disable-directory-archives", "True",
-        "--download-rate-limiter", ZOTIFY_RATE_LIMITER,
+        "--download-rate-limiter", current_rate_limiter(),
         "--retry-attempts", "3",
         "--print-splash", "False",
         "--print-progress-info", "False",
@@ -199,7 +263,7 @@ def _download_timeout(duration_ms: int) -> int:
     if duration_ms <= 0:
         return ZOTIFY_TIMEOUT
     try:
-        rate = float(ZOTIFY_RATE_LIMITER)
+        rate = float(current_rate_limiter())
     except ValueError:
         rate = 1.0
     expected = (duration_ms / 1000.0) * max(rate, 0.1)
@@ -264,12 +328,16 @@ def download_track(spotify_url: str, track_id: str, duration_ms: int = 0) -> Opt
 
     # Ground truth is the output file — zotify's exit code can mask errors
     # (Googolplexed0/zotify issue #222).
+    combined = (proc.stdout or "") + (proc.stderr or "")
+    # Watchdog: scan EVERY download's output (success included — zotify may
+    # retry through audio-key denials and still produce the file).
+    _check_ban_signals(combined, track_id)
+
     path = _find_downloaded(track_id)
     if path:
         log.info("Downloaded: %s → %s", track_id, path)
         return path
 
-    combined = (proc.stdout or "") + (proc.stderr or "")
     if "login" in combined.lower() and "http" in combined.lower():
         log.error(
             "zotify needs its one-time OAuth login. Run this in a terminal and "

@@ -124,7 +124,7 @@ async function pollAnalysis() {
   applyAnalysisResults(data.results);
   const pct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 100;
   setBannerMsg(`Analizando… ${data.done} / ${data.total} canciones`, pct);
-  setBannerDetail(data.current, data.last_done);
+  setBannerDetail(data.current, data.last_done, data.rate);
 
   // Long runs take hours — refresh the DJ-set genre dropdown as clusters
   // cross the minimum-track threshold, not only at the very end.
@@ -146,7 +146,7 @@ async function pollAnalysis() {
   }
 }
 
-function setBannerDetail(current, lastDone) {
+function setBannerDetail(current, lastDone, rate) {
   const el = document.getElementById("analysis-detail");
   if (!el) return;
   const parts = [];
@@ -159,6 +159,14 @@ function setBannerDetail(current, lastDone) {
   if (lastDone && lastDone.title) {
     const bpm = lastDone.bpm ? ` (${lastDone.bpm} BPM)` : "";
     parts.push(`✓ Última: <strong>${lastDone.title}</strong>${bpm}`);
+  }
+  if (rate && rate.effective != null) {
+    // Escalated by the ban-risk watchdog → warn; otherwise just inform.
+    if (rate.escalation_level > 0) {
+      parts.push(`⚠️ ritmo <strong>${rate.effective}x</strong> (auto-frenado desde ${rate.base}x, ${rate.signals} señales)`);
+    } else {
+      parts.push(`⚙️ ritmo ${rate.effective}x`);
+    }
   }
   el.innerHTML = parts.join("&nbsp;&nbsp;·&nbsp;&nbsp;");
 }

@@ -13,7 +13,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from analysis import load_cache, save_cache, analyze_track as _yt_analyze
-from essentia_analysis import analyze_track_full as _local_analyze
+from essentia_analysis import analyze_track_full as _local_analyze, rate_limiter_info
 from getsongbpm import lookup_track, QUOTA_EXCEEDED as _GETSONGBPM_QUOTA
 from lastfm import lookup_track_tags as _lastfm_tags
 from playlist_engine import (
@@ -441,6 +441,7 @@ async def analyze_status():
         "results":    _analysis_state["results"],
         "current":    current,
         "last_done":  _analysis_state.get("last_done"),
+        "rate":       rate_limiter_info() if USE_LOCAL_ANALYSIS else None,
     })
 
 

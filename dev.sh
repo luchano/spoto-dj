@@ -142,6 +142,21 @@ queue_status() {
   echo "Analysis queue:"
   echo "  analyzed:     ${analyzed}${total:+ / ${total}} tracks   (${oggs} audio files on disk)"
 
+  # Effective download pacing from the live server (includes any ban-risk
+  # watchdog escalation), falling back silently if the server is down.
+  local rate_json
+  rate_json="$(curl -sf --max-time 2 "${URL}/api/analyze/status" 2>/dev/null | \
+    .venv/bin/python -c '
+import json, sys
+r = (json.load(sys.stdin) or {}).get("rate") or {}
+if r:
+    tag = ""
+    if int(r.get("escalation_level", 0)) > 0:
+        tag = "  ⚠ AUTO-SLOWED from %sx (%s ban-risk signals)" % (r.get("base"), r.get("signals"))
+    print("  rate:         %sx%s" % (r.get("effective"), tag))
+' 2>/dev/null || true)"
+  [[ -n "$rate_json" ]] && echo "$rate_json"
+
   # What zotify is downloading right now, and for how long. Read the pacing
   # straight from the live process args — that's the truth, not the config.
   local zpid; zpid="$(pgrep -f 'venv-dl/bin/zotify' 2>/dev/null | head -1 || true)"
