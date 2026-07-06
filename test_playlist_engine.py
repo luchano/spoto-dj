@@ -521,6 +521,119 @@ class TestScoreCandidate:
 # Core generator
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestClusterMembership:
+    """Affinity-based genre membership (the fix for weak-tag intruders)."""
+
+    def test_affinity_dominant_cluster_passes(self):
+        from playlist_engine import cluster_membership
+        analysis = {"genre_affinity": {"electronic": 2.31, "downtempo": 0.07}}
+        assert "electronic" in cluster_membership(analysis, [])
+
+    def test_weak_affinity_excluded_reflection_case(self):
+        """Real fixture: Reflection (neoclassical piano) had classical 0.80
+        dominant and electronic 0.29 — it must NOT be in the electronic pool."""
+        from playlist_engine import cluster_membership
+        analysis = {"genre_affinity": {
+            "classical": 0.8038, "jazz": 0.3849, "electronic": 0.2942, "downtempo": 0.1397,
+        }}
+        clusters = cluster_membership(analysis, ["Electronic"])
+        assert "electronic" not in clusters
+        assert "classical" in clusters
+
+    def test_genuine_house_stays_in(self):
+        """Londonbeat: electronic 1.96 dominant — genre-wise it IS house."""
+        from playlist_engine import cluster_membership
+        analysis = {"genre_affinity": {"electronic": 1.9631, "jazz": 0.2741, "pop": 0.2702}}
+        assert "electronic" in cluster_membership(analysis, [])
+
+    def test_legacy_entry_falls_back_to_tags(self):
+        from playlist_engine import cluster_membership
+        assert "electronic" in cluster_membership({}, ["Tech House"])
+
+
+class TestVerifyFindings:
+    """Regression tests for the adversarial-review findings."""
+
+    def test_string_year_from_spotify_does_not_crash_generate(self):
+        """spotify.py stores year as STRING ('2019' or '?') — generate() must
+        coerce, not TypeError on the era comparison (critical finding)."""
+        lib = _make_library(30)
+        for i, t in enumerate(lib):
+            t["year"] = "2019" if i % 2 == 0 else "?"   # library-shaped strings
+        cache = _make_cache(lib)
+        r = generate(lib, cache, duration_min=40)
+        assert r["track_count"] > 0
+
+    def test_build_pool_coerces_year(self):
+        lib = [dict(_track(tid="a"), year="2021"), dict(_track(tid="b"), year="?")]
+        cache = _make_cache(lib)
+        pool = build_pool(lib, cache)
+        years = {t["id"]: t["year"] for t in pool}
+        assert years["a"] == 2021 and years["b"] == 0
+
+    def test_low_affinity_falls_back_to_tags(self):
+        """Boundary inversion: affinity below every threshold must behave like
+        no-affinity (tag fallback), not like empty membership."""
+        from playlist_engine import cluster_membership
+        analysis = {"genre_affinity": {"electronic": 0.09}}   # under MIN_ABS
+        assert "electronic" in cluster_membership(analysis, ["Tech House"])
+
+    def test_missing_style_data_not_rewarded(self):
+        """Single-scale scoring: a candidate WITH matching vocalness must beat
+        an otherwise-identical candidate missing the data (which gets 0.5)."""
+        prev = {"id": "p", "bpm": 122, "camelot": "8A", "energy": 70,
+                "popularity": 50, "artists_list": ["X"], "vocalness": 20, "year": 2022}
+        matching = dict(prev, id="a", artists_list=["A"])
+        missing  = dict(prev, id="b", artists_list=["B"], vocalness=None, year=0)
+        s_match = score_candidate(matching, prev, 0.7, 122, False, set())
+        s_miss  = score_candidate(missing, prev, 0.7, 122, False, set())
+        assert s_match > s_miss
+
+    def test_subgenre_first_attribution(self):
+        """Electronic---Ambient must credit downtempo, NOT electronic — else
+        ambient tracks structurally inflate the electronic cluster."""
+        import essentia_analysis as ea
+        labels = ea._load_genre_labels()
+        if not labels:
+            pytest.skip("labels JSON not downloaded")
+        cmap = ea._label_cluster_map()
+        idx = labels.index("Electronic---Ambient")
+        assert "downtempo" in cmap[idx]
+        assert "electronic" not in cmap[idx]
+        # …while a real electronic subgenre still credits electronic
+        idx2 = labels.index("Electronic---Tech House")
+        assert "electronic" in cmap[idx2]
+
+
+class TestStyleCohesionScoring:
+    def _t(self, **kw):
+        base = {"id": "x", "bpm": 122, "camelot": "8A", "energy": 70,
+                "popularity": 50, "artists_list": ["A"], "vocalness": None, "year": 0}
+        base.update(kw)
+        return base
+
+    def test_vocal_mismatch_penalized(self):
+        prev = self._t(id="p", vocalness=20, year=2022)
+        instrumental = self._t(id="a", vocalness=25, year=2022)
+        vocal        = self._t(id="b", vocalness=92, year=2022)
+        s_i = score_candidate(instrumental, prev, 0.7, 122, False, set())
+        s_v = score_candidate(vocal, prev, 0.7, 122, False, set())
+        assert s_i > s_v
+
+    def test_era_gap_penalized(self):
+        prev = self._t(id="p", vocalness=50, year=2022)
+        modern = self._t(id="a", vocalness=50, year=2021)
+        oldie  = self._t(id="b", vocalness=50, year=1990)
+        assert score_candidate(modern, prev, 0.7, 122, False, set()) > \
+               score_candidate(oldie, prev, 0.7, 122, False, set())
+
+    def test_no_style_data_uses_legacy_weights(self):
+        prev = self._t(id="p")            # vocalness None, year 0
+        cand = self._t(id="a")
+        s = score_candidate(cand, prev, 0.7, 122, False, set())
+        assert s > 0   # doesn't crash, produces sane score
+
+
 class TestTempoPrimitives:
     def test_tempo_distance_pct_same(self):
         from playlist_engine import tempo_distance_pct

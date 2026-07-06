@@ -142,6 +142,15 @@ ZOTIFY_PACING_JITTER = float(os.getenv("ZOTIFY_PACING_JITTER", "5"))
 # Override with env var SPOTO_AUDIO_DIR.
 AUDIO_DIR = Path(os.getenv("SPOTO_AUDIO_DIR", ".audio_files"))
 
+# NOTE on timbre embeddings: we evaluated cosine similarity over mean-pooled
+# EffNet embeddings (raw, z-scored, and over the genre-head outputs at 11 and
+# 400 dims) as a style-cohesion signal for the sequencer, and NONE ordered
+# same-style pairs above different-style pairs on the real library (e.g. two
+# house tracks scored below house·neoclassical-piano). Classifier features
+# mean-pooled over time are not a perceptual similarity space, so no embedding
+# store is kept — style cohesion uses vocalness + era instead, which separated
+# the observed mismatches cleanly (vocalness 91-92 vs 2-22).
+
 # Directory where essentia model files are stored.
 MODELS_DIR = Path(os.getenv("SPOTO_MODELS_DIR", ".essentia_models"))
 
@@ -505,6 +514,7 @@ def analyze_audio(audio_path: Path) -> dict:
 _EFFNET_MODEL     = "discogs-effnet-bs64-1.pb"
 _GENRE_MODEL      = "genre_discogs400-discogs-effnet-1.pb"
 _GENRE_LABELS_JSON = "genre_discogs400-discogs-effnet-1.json"  # authoritative class list
+_VOICE_MODEL      = "voice_instrumental-discogs-effnet-1.pb"   # classes: [instrumental, voice]
 _MODEL_BASE_URL   = "https://essentia.upf.edu/models"
 
 
@@ -522,6 +532,7 @@ def download_models():
         _EFFNET_MODEL: f"{_MODEL_BASE_URL}/feature-extractors/discogs-effnet/{_EFFNET_MODEL}",
         _GENRE_MODEL:  f"{_genre_base}/{_GENRE_MODEL}",
         _GENRE_LABELS_JSON: f"{_genre_base}/{_GENRE_LABELS_JSON}",  # 400-class label map
+        _VOICE_MODEL:  f"{_MODEL_BASE_URL}/classification-heads/voice_instrumental/{_VOICE_MODEL}",
     }
 
     for filename, url in models.items():
@@ -576,59 +587,135 @@ def _clean_genre_labels(raw_labels: list) -> list:
     return ordered
 
 
-def classify_genre(audio_path: Path, top_n: int = 4) -> list:
-    """
-    Classify genre using essentia's Discogs-400 model.
+# Version of the style-inference outputs (genre_affinity attribution rules,
+# vocalness). Bump on logic changes so migrate_style.py recomputes stale rows.
+STYLE_VERSION = 2
 
-    Returns a de-duplicated list of clean genre tags (e.g. ["Glitch",
-    "Vaporwave", "Electronic"]) derived from the top_n raw predictions.
-    Returns [] if models are not downloaded or essentia-tensorflow is not installed.
-    """
-    effnet_path = MODELS_DIR / _EFFNET_MODEL
-    genre_path  = MODELS_DIR / _GENRE_MODEL
+# Cached TF models — loading the graphs takes seconds; reuse across tracks.
+_TF_MODELS: dict = {}
 
-    if not effnet_path.exists() or not genre_path.exists():
-        log.warning(
-            "Essentia models not found in %s — run download_models() first", MODELS_DIR
+
+def _get_tf_models():
+    """Lazily load and cache the EffNet extractor + classification heads."""
+    if _TF_MODELS:
+        return _TF_MODELS
+    import essentia
+    # Reusing cached TF predictors makes essentia print a harmless "No network
+    # created…" warning on every inference — silence it or it floods the log.
+    essentia.log.warningActive = False
+    import essentia.standard as es  # type: ignore
+    _TF_MODELS["effnet"] = es.TensorflowPredictEffnetDiscogs(
+        graphFilename=str(MODELS_DIR / _EFFNET_MODEL),
+        output="PartitionedCall:1",
+    )
+    _TF_MODELS["genre"] = es.TensorflowPredict2D(
+        graphFilename=str(MODELS_DIR / _GENRE_MODEL),
+        input="serving_default_model_Placeholder",
+        output="PartitionedCall:0",
+    )
+    voice_path = MODELS_DIR / _VOICE_MODEL
+    if voice_path.exists():
+        _TF_MODELS["voice"] = es.TensorflowPredict2D(
+            graphFilename=str(voice_path),
+            input="model/Placeholder",
+            output="model/Softmax",
         )
-        return []
+    return _TF_MODELS
+
+
+_CLUSTER_MAP_CACHE = None
+
+
+def _label_cluster_map() -> list:
+    """Clusters (frozenset) credited by each of the 400 Discogs labels, by index.
+
+    SUBGENRE-FIRST attribution: when the child part of "Parent---Child" maps to
+    a cluster on its own, ONLY those clusters receive the label's probability
+    mass. The parent is a fallback for unmapped children. Otherwise every
+    "Electronic---X" label (ambient, downtempo, synth-pop…) would credit the
+    'electronic' cluster too, structurally inflating it and letting ambient
+    tracks pass an electronic genre filter — the exact intruder class the
+    affinity system exists to stop."""
+    global _CLUSTER_MAP_CACHE
+    if _CLUSTER_MAP_CACHE is None:
+        from playlist_engine import tags_to_clusters   # lazy — no import cycle
+        mapping = []
+        for label in _load_genre_labels():
+            _, _, child = label.partition("---")
+            clusters = tags_to_clusters([child.strip()]) if child else set()
+            if not clusters:
+                clusters = tags_to_clusters(_clean_genre_labels([label]))
+            mapping.append(frozenset(clusters))
+        _CLUSTER_MAP_CACHE = mapping
+    return _CLUSTER_MAP_CACHE
+
+
+def analyze_style(audio_path: Path, top_n: int = 4) -> dict:
+    """
+    Full style inference from one embedding pass:
+
+      track_genres   — clean top-N genre tags (as before)
+      genre_affinity — per-cluster probability mass {cluster: 0..1}. The sum of
+                       the model's 400 label probabilities grouped by playlist
+                       genre cluster: the honest "how much of this cluster is
+                       in this track", replacing binary tag membership.
+      vocalness      — 0-100 P(voice) from the voice/instrumental head
+
+    Returns {} if models are missing or inference fails.
+    """
+    if not (MODELS_DIR / _EFFNET_MODEL).exists() or not (MODELS_DIR / _GENRE_MODEL).exists():
+        log.warning("Essentia models not found in %s — run download_models() first", MODELS_DIR)
+        return {}
 
     try:
         import numpy as np
         import essentia.standard as es  # type: ignore
 
-        # Step 1: extract embeddings at 16 kHz (required by EffNet)
+        models = _get_tf_models()
         audio16k = es.MonoLoader(filename=str(audio_path), sampleRate=16000)()
-        embedding_model = es.TensorflowPredictEffnetDiscogs(
-            graphFilename=str(effnet_path),
-            output="PartitionedCall:1",
-        )
-        embeddings = embedding_model(audio16k)
+        embeddings = models["effnet"](audio16k)          # (frames, 1280)
 
-        # Step 2: predict genre from embeddings
-        genre_model = es.TensorflowPredict2D(
-            graphFilename=str(genre_path),
-            input="serving_default_model_Placeholder",
-            output="PartitionedCall:0",
-        )
-        predictions = genre_model(embeddings)
-        avg = np.mean(predictions, axis=0)
-
+        # Genre head
+        avg = np.mean(models["genre"](embeddings), axis=0)
         labels = _load_genre_labels()
         if len(labels) != len(avg):
-            log.error(
-                "Genre label count (%d) != model outputs (%d); skipping genres",
-                len(labels), len(avg),
-            )
-            return []
+            log.error("Genre label count (%d) != model outputs (%d); skipping genres",
+                      len(labels), len(avg))
+            return {}
 
         top_indices = np.argsort(avg)[::-1][:top_n]
-        raw = [labels[i] for i in top_indices]
-        return _clean_genre_labels(raw)
+        track_genres = _clean_genre_labels([labels[i] for i in top_indices])
 
+        # Per-cluster affinity: sum probability mass by cluster.
+        cluster_map = _label_cluster_map()
+        affinity: dict = {}
+        for prob, clusters in zip(avg, cluster_map):
+            for c in clusters:
+                affinity[c] = affinity.get(c, 0.0) + float(prob)
+        affinity = {c: round(v, 4) for c, v in affinity.items() if v >= 0.01}
+
+        # Voice/instrumental head (optional — model may not be downloaded yet)
+        vocalness = None
+        if "voice" in models:
+            voice_pred = np.mean(models["voice"](embeddings), axis=0)
+            vocalness = int(round(float(voice_pred[1]) * 100))   # [instrumental, voice]
+
+        return {
+            "track_genres":   track_genres,
+            "genre_affinity": affinity,
+            "vocalness":      vocalness,
+            # Bump when the affinity attribution logic changes — the migration
+            # script re-processes entries with an older/missing version.
+            "style_version":  STYLE_VERSION,
+        }
     except Exception as e:
-        log.warning("Genre classification failed for %s: %s", audio_path, e)
-        return []
+        log.warning("Style inference failed for %s: %s", audio_path, e)
+        return {}
+
+
+def classify_genre(audio_path: Path, top_n: int = 4) -> list:
+    """Clean top-N genre tags (thin wrapper kept for backward compatibility)."""
+    return analyze_style(audio_path, top_n).get("track_genres", [])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -690,18 +777,23 @@ async def analyze_track_full(
 
         result["source"] = "local"
 
-        # Genre classification (optional, skip if models not present)
+        # Style inference: genres + per-cluster affinity + vocalness,
+        # all from one EffNet pass (optional, skip if models absent)
         if not skip_genre:
             try:
-                genres = await loop.run_in_executor(None, classify_genre, audio_path)
-                result["track_genres"] = genres
+                style = await loop.run_in_executor(None, analyze_style, audio_path)
             except Exception as e:
-                log.warning("Genre classification error for '%s': %s", title, e)
-                result["track_genres"] = []
+                log.warning("Style inference error for '%s': %s", title, e)
+                style = {}
+            result["track_genres"]   = style.get("track_genres", [])
+            result["genre_affinity"] = style.get("genre_affinity", {})
+            result["style_version"]  = style.get("style_version", 0)
+            if style.get("vocalness") is not None:
+                result["vocalness"] = style["vocalness"]
 
         log.info(
-            "Local analysis OK for '%s': bpm=%.1f key=%s camelot=%s genres=%s",
+            "Local analysis OK for '%s': bpm=%.1f key=%s camelot=%s genres=%s vocal=%s",
             title, result.get("bpm", 0), result.get("key"), result.get("camelot"),
-            result.get("track_genres", [])[:2],
+            result.get("track_genres", [])[:2], result.get("vocalness"),
         )
         return track_id, result

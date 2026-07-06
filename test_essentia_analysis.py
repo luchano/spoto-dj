@@ -238,7 +238,7 @@ class TestAnalyzeTrackFull:
         stages = []
         with patch.object(ea, "download_track", return_value=fake_path), \
              patch.object(ea, "analyze_audio", return_value={"bpm": 120}), \
-             patch.object(ea, "classify_genre", return_value=[]):
+             patch.object(ea, "analyze_style", return_value={"track_genres": [], "genre_affinity": {}, "vocalness": 10}):
             self._run(ea.analyze_track_full(
                 TRACK_ID, TRACK_URL, "Song", "Artist", asyncio.Semaphore(1),
                 on_stage=stages.append,
@@ -251,7 +251,7 @@ class TestAnalyzeTrackFull:
         def boom(_stage): raise RuntimeError("ui broke")
         with patch.object(ea, "download_track", return_value=fake_path), \
              patch.object(ea, "analyze_audio", return_value={"bpm": 120}), \
-             patch.object(ea, "classify_genre", return_value=[]):
+             patch.object(ea, "analyze_style", return_value={"track_genres": [], "genre_affinity": {}, "vocalness": 10}):
             tid, result = self._run(ea.analyze_track_full(
                 TRACK_ID, TRACK_URL, "Song", "Artist", asyncio.Semaphore(1),
                 on_stage=boom,
@@ -264,14 +264,16 @@ class TestAnalyzeTrackFull:
         analysis = {"bpm": 122.4, "key": "Bb maj", "camelot": "6B", "energy": 80}
         with patch.object(ea, "download_track", return_value=fake_path), \
              patch.object(ea, "analyze_audio", return_value=dict(analysis)), \
-             patch.object(ea, "classify_genre", return_value=["Electronic---House"]):
+             patch.object(ea, "analyze_style", return_value={"track_genres": ["House", "Electronic"], "genre_affinity": {"electronic": 1.5}, "vocalness": 25}):
             tid, result = self._run(ea.analyze_track_full(
                 TRACK_ID, TRACK_URL, "Song", "Artist", asyncio.Semaphore(1),
             ))
         assert result["bpm"] == 122.4
         assert result["camelot"] == "6B"
         assert result["source"] == "local"
-        assert result["track_genres"] == ["Electronic---House"]
+        assert result["track_genres"] == ["House", "Electronic"]
+        assert result["genre_affinity"] == {"electronic": 1.5}
+        assert result["vocalness"] == 25
 
 
 # ─────────────────────────────────────────────────────────────────────────────

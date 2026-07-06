@@ -413,6 +413,38 @@ def _track_tags(library_track: dict, analysis: dict) -> list:
     return list(library_track.get("genres", [])) + list(analysis.get("track_genres", []))
 
 
+# ── Affinity-based genre membership ──────────────────────────────────────────
+# When the local pipeline stored per-cluster probability mass (genre_affinity),
+# membership means "a meaningful share of what the model heard", not "one weak
+# tag matched". Thresholds calibrated on the real library: the chosen cluster
+# must hold at least AFFINITY_MIN_ABS of probability mass AND be at least
+# AFFINITY_MIN_REL of the track's dominant cluster.
+AFFINITY_MIN_ABS = 0.10
+AFFINITY_MIN_REL = 0.40
+
+
+def cluster_membership(analysis: dict, tags: list) -> set:
+    """Clusters a track genuinely belongs to.
+
+    Prefers audio-derived probability mass (genre_affinity) when the local
+    pipeline provides it; falls back to binary tag matching for legacy entries.
+    """
+    affinity = analysis.get("genre_affinity")
+    if affinity:
+        top = max(affinity.values())
+        if top > 0:
+            passed = {
+                c for c, v in affinity.items()
+                if v >= AFFINITY_MIN_ABS and v >= AFFINITY_MIN_REL * top
+            }
+            if passed:
+                return passed
+        # No cluster cleared the thresholds → the model's read is too diffuse
+        # to trust; fall back to tags exactly like entries with no affinity at
+        # all (otherwise slightly-more-signal would mean LESS membership).
+    return tags_to_clusters(tags)
+
+
 def genre_options(library: list, cache: dict, min_tracks: int = 8) -> list:
     """Dropdown options derived from the user's own library.
 
@@ -427,7 +459,7 @@ def genre_options(library: list, cache: dict, min_tracks: int = 8) -> list:
             continue
         if not (analysis.get("bpm") or 0):
             continue
-        for cluster in tags_to_clusters(_track_tags(t, analysis)):
+        for cluster in cluster_membership(analysis, _track_tags(t, analysis)):
             counts[cluster] += 1
 
     options = [
@@ -463,7 +495,7 @@ def build_pool(library: list, cache: dict) -> list:
             artists_str  = artists_raw
             artists_list = [a.strip() for a in artists_raw.split(",") if a.strip()]
 
-        tags = _track_tags(t, analysis)   # Spotify artist genres + Last.fm track tags
+        tags = _track_tags(t, analysis)   # Spotify artist genres + analyzed track tags
         pool.append({
             "id":             tid,
             "title":          t.get("title", ""),
@@ -474,9 +506,13 @@ def build_pool(library: list, cache: dict) -> list:
             "energy":         analysis.get("energy")  or t.get("energy")  or 0,
             "duration_ms":    t.get("duration_ms", 240_000),
             "popularity":     t.get("popularity", 0),
+            # spotify.py stores year as a STRING ("2019", or "?" when unknown)
+            # — coerce here or the era-cohesion comparison raises TypeError.
+            "year":           int(t["year"]) if str(t.get("year", "")).strip().isdigit() else 0,
+            "vocalness":      analysis.get("vocalness"),
             "genres":         t.get("genres", []),
             "genre_cluster":  classify_genre(tags),      # primary, for display
-            "genre_clusters": tags_to_clusters(tags),    # all clusters, for filtering
+            "genre_clusters": cluster_membership(analysis, tags),  # affinity-aware
             "spotify_url":    t.get("spotify_url", ""),
             "image_url":      t.get("image_url", ""),
         })
@@ -563,7 +599,14 @@ def score_candidate(
     Weighting follows the playlist-sequencing literature (Bittner/Spotify,
     Pauws, hpDJ): transition smoothness DOMINATES, the arc (slot target) comes
     second, harmony third — adjacency is additionally enforced as a hard gate
-    upstream in the beam search, so scoring only ranks feasible options."""
+    upstream in the beam search, so scoring only ranks feasible options.
+
+    When style data is available (vocalness from the local pipeline, release
+    year), a cohesion block keeps consecutive tracks "rhyming" in vocal
+    character and era — e.g. a 1990 vocal euro-house track next to a modern
+    instrumental prog-house run pays a real penalty. (Embedding-cosine timbre
+    similarity was evaluated and rejected: it did not order same-style pairs
+    correctly on real data — see essentia_analysis.py.)"""
 
     bpm_c = candidate["bpm"]
 
@@ -589,11 +632,26 @@ def score_candidate(
         a.lower() in recent_artists for a in candidate["artists_list"]
     ) else 0.0
 
+    # ── Style cohesion vs the previous track (vocalness / era) ──────────────
+    # Missing data scores the NEUTRAL 0.5 — never a different weight scale.
+    # (A dual-scale version systematically favored unanalyzed tracks over
+    # analyzed ones with ordinary, imperfect cohesion.)
+    vocal_c = 0.5
+    if prev is not None and prev.get("vocalness") is not None \
+            and candidate.get("vocalness") is not None:
+        vocal_c = 1.0 - abs(candidate["vocalness"] - prev["vocalness"]) / 100.0
+
+    era_c = 0.5
+    if prev is not None and (prev.get("year") or 0) > 0 and (candidate.get("year") or 0) > 0:
+        era_c = 1.0 - min(abs(candidate["year"] - prev["year"]), 25) / 25.0
+
     raw = (
-        smooth       * 0.35 +
-        arc          * 0.25 +
-        key_s        * 0.20 +
-        energy_score * 0.15 +
+        smooth       * 0.30 +
+        arc          * 0.22 +
+        key_s        * 0.15 +
+        energy_score * 0.12 +
+        vocal_c      * 0.10 +
+        era_c        * 0.06 +
         hit_s        * 0.05
     ) - artist_penalty
 
