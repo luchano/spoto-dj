@@ -31,10 +31,13 @@ except ImportError:  # pragma: no cover
 
 log = logging.getLogger(__name__)
 
-ZAI_API_KEY = os.getenv("ZAI_API_KEY", "")
-ZAI_MODEL   = os.getenv("ZAI_MODEL", "glm-4.6")
+# Accept both naming conventions: ZAI_* and the GLM_* names used in the
+# user's other z.ai projects (oye-bot), so the same .env lines work here.
+ZAI_API_KEY = os.getenv("ZAI_API_KEY") or os.getenv("GLM_API_KEY", "")
+ZAI_MODEL   = os.getenv("ZAI_MODEL") or os.getenv("GLM_MODEL") or "glm-4.6"
 ZAI_URL     = "https://api.z.ai/api/paas/v4/chat/completions"
-ZAI_TIMEOUT = float(os.getenv("ZAI_TIMEOUT", "30"))
+# Thinking mode on a full tracklist can take 30-60 s — be generous.
+ZAI_TIMEOUT = float(os.getenv("ZAI_TIMEOUT") or os.getenv("GLM_TIMEOUT") or "120")
 
 _SYSTEM = (
     "Sos un DJ y director creativo que nombra sets para flyers de fiestas. "
@@ -127,7 +130,7 @@ async def generate_set_name(playlist: dict) -> Optional[str]:
         ],
         "thinking": {"type": "enabled"},
         "temperature": 0.9,
-        "max_tokens": 2000,   # headroom for reasoning + the short answer
+        "max_tokens": 4000,   # GLM-5 thinking alone can run ~2k tokens
     }
     try:
         async with httpx.AsyncClient(timeout=ZAI_TIMEOUT) as client:
@@ -145,7 +148,7 @@ async def generate_set_name(playlist: dict) -> Optional[str]:
             log.info("z.ai set name: %r", name)
         return name
     except Exception as e:
-        log.warning("z.ai naming error: %s", e)
+        log.warning("z.ai naming error: %s: %s", type(e).__name__, e)
         return None
 
 

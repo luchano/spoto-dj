@@ -531,8 +531,24 @@ async def api_genre_options(request: Request):
     return JSONResponse({"genres": options})
 
 
+async def _ai_rename_playlist(pid: str, provisional: dict):
+    """Background task: prepend the AI-generated creative name to a stored
+    playlist's auto-name once GLM answers. No-op on any failure."""
+    ai_name = await generate_set_name(provisional)
+    if not ai_name:
+        return
+    playlists = load_playlists()
+    pl = playlists.get(pid)
+    if not pl:
+        return   # deleted meanwhile
+    pl["name"] = f"{ai_name} · {pl['name']}"
+    playlists[pid] = pl
+    save_playlists(playlists)
+    log.info("Playlist %s renamed by AI: %r", pid, pl["name"])
+
+
 @app.post("/api/playlists/generate")
-async def api_generate_playlist(request: Request):
+async def api_generate_playlist(request: Request, background_tasks: BackgroundTasks):
     session = _get_session(request)
     access_token = session.get("access_token")
     if not access_token:
@@ -573,17 +589,22 @@ async def api_generate_playlist(request: Request):
     if "error" in result:
         raise HTTPException(400, result["error"])
 
-    # Creative set name via z.ai (GLM + thinking) when the user didn't type
-    # one. Fail-safe: any error/timeout/missing key falls back to the standard
-    # auto-name; naming never blocks or breaks generation.
-    if not name:
-        provisional = {"tracks": result["tracks"],
-                       "total_duration_ms": result["total_duration_ms"],
-                       "params": params}
-        name = await generate_set_name(provisional)
-
     playlist = create_playlist(result, params, name=name)
     log.info("Playlist generated: %s (%d tracks)", playlist["name"], playlist["track_count"])
+
+    # Creative set name via z.ai (GLM + thinking) when the user didn't type
+    # one. GLM-5's reasoning takes 45-90 s, so the set is returned immediately
+    # with the standard auto-name and renamed IN THE BACKGROUND when the model
+    # answers. Fail-safe: any error/timeout/missing key keeps the auto-name.
+    if not name:
+        background_tasks.add_task(
+            _ai_rename_playlist,
+            playlist["id"],
+            {"tracks": result["tracks"],
+             "total_duration_ms": result["total_duration_ms"],
+             "params": params},
+        )
+
     return JSONResponse(playlist)
 
 
