@@ -21,6 +21,7 @@ from playlist_engine import (
     create_playlist, delete_playlist, generate as generate_playlist,
     genre_options, load_playlists, save_playlists,
 )
+from set_namer import generate_set_name
 from spotify import build_track_library
 
 log = logging.getLogger("spoto")
@@ -571,6 +572,15 @@ async def api_generate_playlist(request: Request):
 
     if "error" in result:
         raise HTTPException(400, result["error"])
+
+    # Creative set name via z.ai (GLM + thinking) when the user didn't type
+    # one. Fail-safe: any error/timeout/missing key falls back to the standard
+    # auto-name; naming never blocks or breaks generation.
+    if not name:
+        provisional = {"tracks": result["tracks"],
+                       "total_duration_ms": result["total_duration_ms"],
+                       "params": params}
+        name = await generate_set_name(provisional)
 
     playlist = create_playlist(result, params, name=name)
     log.info("Playlist generated: %s (%d tracks)", playlist["name"], playlist["track_count"])
