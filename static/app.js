@@ -418,11 +418,36 @@ async function generatePlaylist() {
     await loadPlaylists();
     // Auto-open the new set
     openPLDetail(data.id);
+    // The AI name arrives ~40-90s later (background rename on the server) —
+    // poll a few times and refresh the UI when it lands.
+    if (!body.name) watchAiRename(data.id, data.name);
   } catch (e) {
     status.textContent = `Error: ${e.message}`;
   } finally {
     btn.disabled = false;
   }
+}
+
+function watchAiRename(pid, originalName, attempt = 0) {
+  if (attempt >= 8) return;          // ~2 min, then give up quietly
+  setTimeout(async () => {
+    try {
+      const res = await fetch(`/api/playlists/${pid}`);
+      if (!res.ok) return;
+      const p = await res.json();
+      if (p.name && p.name !== originalName) {
+        // Rename landed: refresh list, detail header (if open) and status.
+        loadPlaylists();
+        if (currentPlaylistId === pid) {
+          document.getElementById("pl-detail-name").textContent = p.name;
+        }
+        const status = document.getElementById("pl-gen-status");
+        if (status) status.textContent = `✨ "${p.name}"`;
+        return;
+      }
+    } catch (e) { /* keep polling */ }
+    watchAiRename(pid, originalName, attempt + 1);
+  }, 15000);
 }
 
 async function loadPlaylists() {
