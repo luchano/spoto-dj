@@ -205,6 +205,12 @@ def _ensure_dir(path: Path):
 # Download
 # ─────────────────────────────────────────────────────────────────────────────
 
+# Sentinel returned by download_track() when Spotify reports the track as
+# unavailable (delisted / region-blocked) — a PERMANENT condition, unlike a
+# generic download failure which is retried on the next run.
+UNAVAILABLE = "UNAVAILABLE"
+
+
 def _find_downloaded(track_id: str) -> Optional[Path]:
     """Return the cached audio file for a track, if any."""
     for ext in (".ogg", ".m4a", ".mp3", ".opus", ".flac", ".wav"):
@@ -346,6 +352,14 @@ def download_track(spotify_url: str, track_id: str, duration_ms: int = 0) -> Opt
     if path:
         log.info("Downloaded: %s → %s", track_id, path)
         return path
+
+    # Track delisted/region-blocked on Spotify: zotify prints
+    # 'SKIPPING: "…" (TRACK IS UNAVAILABLE)' and exits 0. This is PERMANENT —
+    # signal it so the caller caches the error and stops retrying the track
+    # on every analysis run (each retry costs a zotify spawn + API hits).
+    if "IS UNAVAILABLE)" in combined:
+        log.info("Track unavailable on Spotify: %s", track_id)
+        return UNAVAILABLE
 
     if "login" in combined.lower() and "http" in combined.lower():
         log.error(
@@ -765,6 +779,10 @@ async def analyze_track_full(
         audio_path = await loop.run_in_executor(
             None, download_track, spotify_url, track_id, duration_ms,
         )
+        if audio_path == UNAVAILABLE:
+            # Permanent ("not found" prefix → cached, never retried): the
+            # track is delisted/region-blocked on Spotify itself.
+            return track_id, {"error": f"not found: '{title}' is unavailable on Spotify"}
         if not audio_path:
             return track_id, {"error": f"audio download failed for '{title}'"}
 

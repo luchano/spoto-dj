@@ -133,6 +133,15 @@ class TestDownloadTrack:
         ):
             assert ea.download_track(TRACK_URL, TRACK_ID) is None
 
+    def test_unavailable_track_returns_sentinel(self, audio_dir, fake_zotify, logged_in):
+        """zotify exits 0 and prints 'SKIPPING: "…" (TRACK IS UNAVAILABLE)'
+        for delisted/region-blocked tracks — that must surface as the
+        permanent UNAVAILABLE sentinel, not a retryable failure."""
+        out = '套 SKIPPING:  "Acid Pauli - Anan" (TRACK IS UNAVAILABLE)'
+        ok = subprocess.CompletedProcess([], 0, stdout=out, stderr="")
+        with patch.object(ea.subprocess, "run", return_value=ok):
+            assert ea.download_track(TRACK_URL, TRACK_ID) is ea.UNAVAILABLE
+
     def test_stdin_devnull(self, audio_dir, fake_zotify, logged_in):
         """zotify must never be able to block waiting for interactive input."""
         captured = {}
@@ -231,6 +240,18 @@ class TestAnalyzeTrackFull:
             ))
         assert tid == TRACK_ID
         assert "error" in result and "download failed" in result["error"]
+
+    def test_unavailable_becomes_permanent_not_found_error(self, audio_dir, monkeypatch):
+        """The 30-tracks-reanalyzed-on-every-refresh bug: unavailable tracks
+        must produce a 'not found' (PERMANENT → cached) error, not the
+        transient 'audio download failed'."""
+        monkeypatch.setattr(ea, "ZOTIFY_PACING_JITTER", 0.0)
+        with patch.object(ea, "download_track", return_value=ea.UNAVAILABLE):
+            tid, result = self._run(ea.analyze_track_full(
+                TRACK_ID, TRACK_URL, "Anan", "Acid Pauli", asyncio.Semaphore(1),
+            ))
+        assert result["error"].startswith("not found")
+        assert "unavailable" in result["error"]
 
     def test_on_stage_fires_downloading_then_analyzing(self, audio_dir, monkeypatch):
         monkeypatch.setattr(ea, "ZOTIFY_PACING_JITTER", 0.0)
