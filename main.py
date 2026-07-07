@@ -2,8 +2,10 @@ import asyncio
 import logging
 import os
 import secrets
+import time
 import urllib.parse
 from pathlib import Path
+from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
@@ -12,12 +14,14 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from analysis import load_cache, save_cache, analyze_track as _yt_analyze
+from essentia_analysis import analyze_track_full as _local_analyze, rate_limiter_info
 from getsongbpm import lookup_track, QUOTA_EXCEEDED as _GETSONGBPM_QUOTA
 from lastfm import lookup_track_tags as _lastfm_tags
 from playlist_engine import (
     create_playlist, delete_playlist, generate as generate_playlist,
-    genre_options, load_playlists, save_playlists,
+    genre_options, load_playlists, plan_library_tour, save_playlists,
 )
+from set_namer import generate_set_name
 from spotify import build_track_library
 
 log = logging.getLogger("spoto")
@@ -53,6 +57,11 @@ SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))
 GETSONGBPM_API_KEY = os.getenv("GETSONGBPM_API_KEY", "")
 LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "")
 
+# Local audio pipeline (zotify + essentia).
+# Set USE_LOCAL_ANALYSIS=true to use this instead of GetSongBPM + Last.fm.
+# zotify setup (one-time) is documented in essentia_analysis.py.
+USE_LOCAL_ANALYSIS = os.getenv("USE_LOCAL_ANALYSIS", "false").lower() == "true"
+
 SCOPES = "user-library-read playlist-modify-public playlist-modify-private"
 SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
@@ -68,6 +77,8 @@ _analysis_state: dict = {
     "total": 0,
     "done": 0,
     "results": {},
+    "current": None,      # {title, artists, stage: downloading|analyzing, started: epoch}
+    "last_done": None,    # {title, bpm, finished: epoch}
 }
 
 static_dir = Path(__file__).parent / "static"
@@ -75,7 +86,10 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 # Error prefixes that are permanent (not transient) — safe to cache so we don't
 # waste API calls retrying them. Defined at module level so _lookup() can use it.
-_PERMANENT_ERRORS = ("not found", "incomplete data")
+# "essentia analysis failed" is deterministic (corrupt/edge-case audio fails the
+# same way every run) — without caching it, the track re-downloads/re-analyzes
+# on every page refresh forever.
+_PERMANENT_ERRORS = ("not found", "incomplete data", "essentia analysis failed")
 
 
 def _set_session(response, session_id: str, data: dict):
@@ -88,6 +102,54 @@ def _get_session(request: Request) -> dict:
     return _sessions.get(sid, {}) if sid else {}
 
 
+async def _refresh_access_token(session: dict, client: httpx.AsyncClient) -> Optional[str]:
+    """Exchange the stored refresh token for a fresh access token.
+
+    Spotify access tokens expire after 1 hour; the refresh token (saved at
+    login) is long-lived. Updates the session dict in place — since
+    _get_session returns the live _sessions entry, the new token persists.
+    Returns the new access token, or None if refresh isn't possible.
+    """
+    refresh = session.get("refresh_token")
+    if not refresh:
+        return None
+    try:
+        resp = await client.post(SPOTIFY_TOKEN_URL, data={
+            "grant_type":    "refresh_token",
+            "refresh_token": refresh,
+            "client_id":     CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        })
+    except Exception as e:
+        log.warning("Token refresh request failed: %s", e)
+        return None
+    if resp.status_code != 200:
+        log.warning("Token refresh failed: %d %s", resp.status_code, resp.text[:200])
+        return None
+    data = resp.json()
+    session["access_token"] = data["access_token"]
+    # Spotify only sometimes rotates the refresh token — keep the old one if not.
+    if data.get("refresh_token"):
+        session["refresh_token"] = data["refresh_token"]
+    if data.get("expires_in"):
+        session["expires_at"] = time.time() + data["expires_in"]
+    log.info("Refreshed Spotify access token")
+    return data["access_token"]
+
+
+async def _spotify_request(client, session, method, url, **kwargs):
+    """Make a Spotify API call, transparently refreshing the token once on 401."""
+    headers = dict(kwargs.pop("headers", {}))
+    headers["Authorization"] = f"Bearer {session.get('access_token')}"
+    resp = await client.request(method, url, headers=headers, **kwargs)
+    if resp.status_code == 401:
+        new_token = await _refresh_access_token(session, client)
+        if new_token:
+            headers["Authorization"] = f"Bearer {new_token}"
+            resp = await client.request(method, url, headers=headers, **kwargs)
+    return resp
+
+
 def _primary_artist(track: dict) -> str:
     """Extract the first artist name from a track dict (handles str or list)."""
     raw = track.get("artists", "")
@@ -98,17 +160,45 @@ def _primary_artist(track: dict) -> str:
 
 async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache: dict):
     """
-    tracks            — tracks NOT in cache; get BPM (GetSongBPM) + genres (Last.fm)
-    to_genre_backfill — tracks already in cache but missing track_genres; Last.fm only
+    tracks            — tracks NOT in cache; get BPM + genres
+    to_genre_backfill — tracks already in cache but missing track_genres; genre only
     cache             — full audio cache dict (mutated in place)
+
+    When USE_LOCAL_ANALYSIS=true: downloads audio via zotify and analyzes with essentia.
+    Otherwise: uses GetSongBPM API + Last.fm (original flow).
     """
     log.info(
-        "Analysis started: %d new tracks (BPM + genre), %d cached tracks (genre backfill)",
+        "Analysis started [%s]: %d new tracks, %d genre backfill",
+        "local/essentia" if USE_LOCAL_ANALYSIS else "GetSongBPM+LastFm",
         len(tracks), len(to_genre_backfill),
     )
     bpm_sem = asyncio.Semaphore(2)   # conservative for GetSongBPM free tier
     lfm_sem = asyncio.Semaphore(5)   # Last.fm allows 5 req/s on free tier
     yt_sem  = asyncio.Semaphore(3)   # YouTube downloads: 3 concurrent max
+    # Local pipeline: downloads MUST be strictly sequential (one zotify
+    # subprocess at a time) — the recommended anti-rate-limit pattern.
+    local_sem = asyncio.Semaphore(1)
+
+    async def _local_lookup(track: dict):
+        """Download + analyze locally with zotify + essentia."""
+        def _on_stage(stage: str):
+            # Fires when this track actually acquires the download slot
+            # (sequential), so "current" reflects the live pipeline state.
+            _analysis_state["current"] = {
+                "title": track.get("title", ""),
+                "artists": track.get("artists", ""),
+                "stage": stage,
+                "started": time.time(),
+            }
+        return await _local_analyze(
+            track_id=track["id"],
+            spotify_url=track.get("spotify_url", ""),
+            title=track.get("title", ""),
+            artists=track.get("artists", ""),
+            semaphore=local_sem,
+            on_stage=_on_stage,
+            duration_ms=track.get("duration_ms", 0),
+        )
 
     async def _lookup(track: dict):
         """Full lookup: BPM via GetSongBPM (+ YouTube fallback) + genres via Last.fm."""
@@ -158,7 +248,12 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
             if lfm_tags and tid in _analysis_state["results"]:
                 _analysis_state["results"][tid]["track_genres"] = lfm_tags
 
-    tasks          = [asyncio.create_task(_lookup(t)) for t in tracks]
+    lookup_fn = _local_lookup if USE_LOCAL_ANALYSIS else _lookup
+    titles = {t["id"]: t.get("title", "") for t in tracks}
+
+    tasks          = [asyncio.create_task(lookup_fn(t)) for t in tracks]
+    # Genre backfill: use local pipeline if enabled (re-classify existing audio files),
+    # otherwise fall back to Last.fm
     backfill_tasks = [asyncio.create_task(_genre_only(t)) for t in to_genre_backfill]
 
     errors = 0
@@ -183,14 +278,24 @@ async def _run_analysis(tracks: list[dict], to_genre_backfill: list[dict], cache
         else:
             cache[track_id] = result
             _analysis_state["results"][track_id] = result
+            _analysis_state["last_done"] = {
+                "title": titles.get(track_id, track_id),
+                "bpm": result.get("bpm"),
+                "finished": time.time(),
+            }
         _analysis_state["done"] += 1
-        if _analysis_state["done"] % 50 == 0:
-            save_cache(cache)
+        # Persist after every track: the local pipeline is slow and often
+        # interrupted (server restart), so a coarse checkpoint would lose all
+        # in-flight work. The cache write is atomic and cheap (ms) next to the
+        # seconds-per-track download+analysis.
+        save_cache(cache)
+        if _analysis_state["done"] % 25 == 0:
             log.info("Progress: %d/%d (errors: %d)", _analysis_state["done"], len(tracks), errors)
 
     # BPM analysis done — mark complete so the frontend stops the progress bar
     save_cache(cache)
     _analysis_state["running"] = False
+    _analysis_state["current"] = None
     log.info("BPM done: %d/%d found, %d errors", len(tracks) - errors, len(tracks), errors)
 
     # Genre backfill — already marked backfilling=True in start_analyze before response was sent
@@ -314,12 +419,24 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
     if not library:
         raise HTTPException(400, "Load tracks first via /api/tracks")
 
-    if not GETSONGBPM_API_KEY:
+    if not USE_LOCAL_ANALYSIS and not GETSONGBPM_API_KEY:
         raise HTTPException(503, "GETSONGBPM_API_KEY not configured")
 
     cache = load_cache()
     _analysis_state["results"] = {k: v for k, v in cache.items() if "error" not in v}
-    to_analyze = [t for t in library if t["id"] not in cache]
+
+    def _needs_analysis(t: dict) -> bool:
+        entry = cache.get(t["id"])
+        if entry is None:
+            return True
+        # Local mode: re-analyze entries cached before the loudness/danceability
+        # calibration (they lack 'loudness' and carry the old saturated energy).
+        # Re-analysis is cheap — the audio file is already downloaded.
+        if USE_LOCAL_ANALYSIS and "error" not in entry and "loudness" not in entry:
+            return True
+        return False
+
+    to_analyze = [t for t in library if _needs_analysis(t)]
 
     # Tracks in cache but with no Last.fm genre tags → backfill silently alongside
     # BPM analysis. We re-query empty results too (not just missing ones): the
@@ -349,6 +466,8 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
         "backfilling": bool(to_genre_backfill),
         "total": len(to_analyze),
         "done": 0,
+        "current": None,
+        "last_done": None,
     })
 
     if to_analyze or to_genre_backfill:
@@ -364,12 +483,18 @@ async def start_analyze(request: Request, background_tasks: BackgroundTasks):
 
 @app.get("/api/analyze/status")
 async def analyze_status():
+    current = _analysis_state.get("current")
+    if current:
+        current = {**current, "elapsed": round(time.time() - current["started"])}
     return JSONResponse({
         "running":    _analysis_state["running"],
         "backfilling": _analysis_state["backfilling"],
         "done":       _analysis_state["done"],
         "total":      _analysis_state["total"],
         "results":    _analysis_state["results"],
+        "current":    current,
+        "last_done":  _analysis_state.get("last_done"),
+        "rate":       rate_limiter_info() if USE_LOCAL_ANALYSIS else None,
     })
 
 
@@ -409,8 +534,24 @@ async def api_genre_options(request: Request):
     return JSONResponse({"genres": options})
 
 
+async def _ai_rename_playlist(pid: str, provisional: dict):
+    """Background task: prepend the AI-generated creative name to a stored
+    playlist's auto-name once GLM answers. No-op on any failure."""
+    ai_name = await generate_set_name(provisional)
+    if not ai_name:
+        return
+    playlists = load_playlists()
+    pl = playlists.get(pid)
+    if not pl:
+        return   # deleted meanwhile
+    pl["name"] = f"{ai_name} · {pl['name']}"
+    playlists[pid] = pl
+    save_playlists(playlists)
+    log.info("Playlist %s renamed by AI: %r", pid, pl["name"])
+
+
 @app.post("/api/playlists/generate")
-async def api_generate_playlist(request: Request):
+async def api_generate_playlist(request: Request, background_tasks: BackgroundTasks):
     session = _get_session(request)
     access_token = session.get("access_token")
     if not access_token:
@@ -453,7 +594,77 @@ async def api_generate_playlist(request: Request):
 
     playlist = create_playlist(result, params, name=name)
     log.info("Playlist generated: %s (%d tracks)", playlist["name"], playlist["track_count"])
+
+    # Creative set name via z.ai (GLM + thinking) when the user didn't type
+    # one. GLM-5's reasoning takes 45-90 s, so the set is returned immediately
+    # with the standard auto-name and renamed IN THE BACKGROUND when the model
+    # answers. Fail-safe: any error/timeout/missing key keeps the auto-name.
+    if not name:
+        background_tasks.add_task(
+            _ai_rename_playlist,
+            playlist["id"],
+            {"tracks": result["tracks"],
+             "total_duration_ms": result["total_duration_ms"],
+             "params": params},
+        )
+
     return JSONResponse(playlist)
+
+
+@app.post("/api/playlists/tour")
+async def api_library_tour(request: Request, background_tasks: BackgroundTasks):
+    """Partition the WHOLE analyzed library into cohesive, disjoint DJ sets.
+
+    Body: {"dry_run": true} returns the proposed plan without creating
+    anything; {"dry_run": false} creates every set (AI names arrive in the
+    background, one by one)."""
+    session = _get_session(request)
+    access_token = session.get("access_token")
+    if not access_token:
+        raise HTTPException(401, "Not authenticated")
+    library = _track_cache.get(access_token, [])
+    if not library:
+        raise HTTPException(400, "Load tracks first via /api/tracks")
+
+    body = await request.json()
+    dry_run = bool(body.get("dry_run", True))
+
+    plan = plan_library_tour(library, load_cache())
+    if not plan["sets"]:
+        raise HTTPException(400, "No analysed tracks to build a tour from.")
+
+    summary = [
+        {
+            "label":        s["label"],
+            "count":        s["count"],
+            "duration_ms":  s["duration_ms"],
+            "bpm_lo":       s["bpm_lo"],
+            "bpm_hi":       s["bpm_hi"],
+            "short":        s["short"],
+            "sample":       [f'{t["title"]} — {t["artists"]}'
+                             for t in s["result"]["tracks"][:3]],
+        }
+        for s in plan["sets"]
+    ]
+    if dry_run:
+        return JSONResponse({"dry_run": True, "sets": summary, "stats": plan["stats"],
+                             "unplaced": plan["unplaced"]})
+
+    created = []
+    for s in plan["sets"]:
+        params = {"tour": True, "duration_min": round(s["duration_ms"] / 60000),
+                  "genre_filter": None, "bpm_range": None}
+        pl = create_playlist(s["result"], params, name=s["label"])
+        created.append({"id": pl["id"], "name": pl["name"]})
+        # AI flavor name lands later, one set at a time (sequential background)
+        background_tasks.add_task(
+            _ai_rename_playlist, pl["id"],
+            {"tracks": s["result"]["tracks"],
+             "total_duration_ms": s["duration_ms"], "params": params},
+        )
+    log.info("Library tour created: %d sets, %d tracks placed",
+             len(created), plan["stats"]["placed"])
+    return JSONResponse({"dry_run": False, "created": created, "stats": plan["stats"]})
 
 
 @app.get("/api/playlists/{pid}")
@@ -477,14 +688,86 @@ async def api_delete_playlist(request: Request, pid: str):
     return JSONResponse({"ok": True})
 
 
+async def _export_one(client: httpx.AsyncClient, session: dict, playlist: dict) -> dict:
+    """Create the Spotify playlist + add its tracks. Returns {id, url}.
+    Raises HTTPException on failure (401 expired / 502 API error)."""
+    user_id = session.get("spotify_user_id")
+    json_headers = {"Content-Type": "application/json"}
+
+    create_resp = await _spotify_request(
+        client, session, "POST",
+        f"https://api.spotify.com/v1/users/{user_id}/playlists",
+        headers=json_headers,
+        json={
+            "name":        playlist["name"],
+            "description": f"Generated by Spoto DJ — {playlist['track_count']} tracks",
+            "public":      False,
+        },
+    )
+    if create_resp.status_code == 401:
+        raise HTTPException(401, "Spotify session expired — please log in again")
+    if create_resp.status_code not in (200, 201):
+        raise HTTPException(502, f"Spotify create playlist failed: {create_resp.status_code}")
+    spotify_pid = create_resp.json()["id"]
+    spotify_url = create_resp.json()["external_urls"]["spotify"]
+
+    uris = [f"spotify:track:{t['spotify_id']}" for t in playlist["tracks"]]
+    for i in range(0, len(uris), 100):
+        add_resp = await _spotify_request(
+            client, session, "POST",
+            f"https://api.spotify.com/v1/playlists/{spotify_pid}/tracks",
+            headers=json_headers,
+            json={"uris": uris[i:i + 100]},
+        )
+        if add_resp.status_code not in (200, 201):
+            log.warning("Add tracks batch failed: %d", add_resp.status_code)
+
+    return {"id": spotify_pid, "url": spotify_url}
+
+
+@app.post("/api/playlists/export-all")
+async def export_all_playlists(request: Request):
+    """Export every saved set that isn't on Spotify yet. Sequential, gentle."""
+    session = _get_session(request)
+    if not session.get("access_token"):
+        raise HTTPException(401, "Not authenticated")
+    if not session.get("spotify_user_id"):
+        raise HTTPException(403, "Re-login required for playlist export (missing Spotify user ID)")
+
+    playlists = load_playlists()
+    pending = {pid: pl for pid, pl in playlists.items()
+               if not pl.get("spotify_playlist_id")}
+    exported, failed = [], []
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        for pid, pl in pending.items():
+            try:
+                res = await _export_one(client, session, pl)
+            except HTTPException as e:
+                if e.status_code == 401:
+                    raise   # token beyond refresh — surface to the user
+                failed.append({"id": pid, "name": pl["name"], "detail": e.detail})
+                continue
+            pl["spotify_playlist_id"]  = res["id"]
+            pl["spotify_playlist_url"] = res["url"]
+            playlists[pid] = pl
+            save_playlists(playlists)          # persist progress per playlist
+            exported.append({"id": pid, "name": pl["name"], "url": res["url"]})
+            log.info("Exported %s → %s", pl["name"][:50], res["url"])
+            await asyncio.sleep(0.4)           # gentle on the API rate limit
+
+    skipped = len(playlists) - len(pending)
+    log.info("Export-all done: %d exported, %d failed, %d already on Spotify",
+             len(exported), len(failed), skipped)
+    return JSONResponse({"exported": exported, "failed": failed, "skipped": skipped})
+
+
 @app.post("/api/playlists/{pid}/export")
 async def export_playlist(request: Request, pid: str):
     session = _get_session(request)
-    access_token = session.get("access_token")
-    user_id = session.get("spotify_user_id")
-    if not access_token:
+    if not session.get("access_token"):
         raise HTTPException(401, "Not authenticated")
-    if not user_id:
+    if not session.get("spotify_user_id"):
         raise HTTPException(403, "Re-login required for playlist export (missing Spotify user ID)")
 
     playlists = load_playlists()
@@ -492,43 +775,16 @@ async def export_playlist(request: Request, pid: str):
         raise HTTPException(404, "Playlist not found")
     playlist = playlists[pid]
 
-    headers = {"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"}
     async with httpx.AsyncClient(timeout=30) as client:
-        # 1. Create empty Spotify playlist
-        create_resp = await client.post(
-            f"https://api.spotify.com/v1/users/{user_id}/playlists",
-            headers=headers,
-            json={
-                "name":        playlist["name"],
-                "description": f"Generated by Spoto DJ — {playlist['track_count']} tracks",
-                "public":      False,
-            },
-        )
-        if create_resp.status_code not in (200, 201):
-            raise HTTPException(502, f"Spotify create playlist failed: {create_resp.status_code}")
-        spotify_pid = create_resp.json()["id"]
-        spotify_url = create_resp.json()["external_urls"]["spotify"]
+        res = await _export_one(client, session, playlist)
 
-        # 2. Add tracks in batches of 100
-        uris = [f"spotify:track:{t['spotify_id']}" for t in playlist["tracks"]]
-        for i in range(0, len(uris), 100):
-            batch = uris[i:i + 100]
-            add_resp = await client.post(
-                f"https://api.spotify.com/v1/playlists/{spotify_pid}/tracks",
-                headers=headers,
-                json={"uris": batch},
-            )
-            if add_resp.status_code not in (200, 201):
-                log.warning("Add tracks batch failed: %d", add_resp.status_code)
-
-    # 3. Persist Spotify IDs
-    playlist["spotify_playlist_id"]  = spotify_pid
-    playlist["spotify_playlist_url"] = spotify_url
+    playlist["spotify_playlist_id"]  = res["id"]
+    playlist["spotify_playlist_url"] = res["url"]
     playlists[pid] = playlist
     save_playlists(playlists)
 
-    log.info("Exported playlist %s → %s", pid, spotify_url)
-    return JSONResponse({"spotify_playlist_url": spotify_url, "spotify_playlist_id": spotify_pid})
+    log.info("Exported playlist %s → %s", pid, res["url"])
+    return JSONResponse({"spotify_playlist_url": res["url"], "spotify_playlist_id": res["id"]})
 
 
 @app.get("/logout")

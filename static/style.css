@@ -98,8 +98,19 @@ h1 { font-size: 20px; font-weight: 700; letter-spacing: -0.3px; }
   display: flex;
   align-items: center;
   gap: 16px;
+  flex-wrap: wrap;
 }
 #analysis-msg { color: var(--muted); font-size: 13px; white-space: nowrap; }
+#analysis-detail {
+  flex-basis: 100%;
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#analysis-detail:empty { display: none; }
+#analysis-detail strong { color: var(--fg); font-weight: 500; }
 .progress-bar {
   flex: 1;
   height: 4px;

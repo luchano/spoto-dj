@@ -14,3 +14,13 @@ build/
 # Local runtime data (per-user state, not source)
 .audio_cache.json
 .playlists.json
+
+# Local audio pipeline (zotify + essentia)
+.venv-dl/
+.audio_files/
+.essentia_models/
+cookies.txt
+
+# dev.sh runtime files
+.dev-server.pid
+.dev-server.log
