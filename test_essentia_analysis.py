@@ -228,6 +228,43 @@ class TestDownloadTimeout:
         assert ea._download_timeout(300_000) >= ea.ZOTIFY_TIMEOUT
 
 
+class TestMaybeExcerpt:
+    def test_short_track_uses_original(self, tmp_path):
+        f = tmp_path / "song.ogg"; f.write_bytes(b"x")
+        path, cleanup = ea._maybe_excerpt(f, 4 * 60 * 1000)   # 4 min
+        assert path == f and cleanup is None
+
+    def test_unknown_duration_uses_original(self, tmp_path):
+        f = tmp_path / "song.ogg"; f.write_bytes(b"x")
+        path, cleanup = ea._maybe_excerpt(f, 0)
+        assert path == f and cleanup is None
+
+    def test_long_track_extracts_centered_excerpt(self, tmp_path):
+        f = tmp_path / "mix.ogg"; f.write_bytes(b"x")
+        captured = {}
+        def fake_run(cmd, **kw):
+            captured["cmd"] = cmd
+            Path(cmd[-1]).write_bytes(b"wav-data")   # ffmpeg "wrote" the excerpt
+            return subprocess.CompletedProcess(cmd, 0)
+        with patch.object(ea.subprocess, "run", side_effect=fake_run):
+            path, cleanup = ea._maybe_excerpt(f, 76 * 60 * 1000)   # 76 min
+        try:
+            assert path != f and cleanup == path
+            cmd = captured["cmd"]
+            # centered: starts at (76*60/2 - 300) = 1980 s, lasts 600 s
+            assert cmd[cmd.index("-ss") + 1] == "1980"
+            assert cmd[cmd.index("-t") + 1] == "600"
+        finally:
+            if cleanup: cleanup.unlink(missing_ok=True)
+
+    def test_ffmpeg_failure_falls_back_to_original(self, tmp_path):
+        f = tmp_path / "mix.ogg"; f.write_bytes(b"x")
+        fail = subprocess.CompletedProcess([], 1)
+        with patch.object(ea.subprocess, "run", return_value=fail):
+            path, cleanup = ea._maybe_excerpt(f, 76 * 60 * 1000)
+        assert path == f and cleanup is None
+
+
 class TestAnalyzeTrackFull:
     def _run(self, coro):
         return asyncio.get_event_loop().run_until_complete(coro)
@@ -240,6 +277,29 @@ class TestAnalyzeTrackFull:
             ))
         assert tid == TRACK_ID
         assert "error" in result and "download failed" in result["error"]
+
+    def test_long_track_analyzed_via_excerpt(self, audio_dir, monkeypatch, tmp_path):
+        """76-min continuous mixes crash essentia's rhythm extractor — they
+        must be analyzed through the mid-track excerpt, flagged as such, and
+        the temp file cleaned up."""
+        monkeypatch.setattr(ea, "ZOTIFY_PACING_JITTER", 0.0)
+        real = audio_dir / f"{TRACK_ID}.ogg"
+        excerpt = tmp_path / "excerpt.wav"; excerpt.write_bytes(b"wav")
+        analyzed_paths = []
+        def fake_analyze(path):
+            analyzed_paths.append(path)
+            return {"bpm": 123.0}
+        with patch.object(ea, "download_track", return_value=real), \
+             patch.object(ea, "_maybe_excerpt", return_value=(excerpt, excerpt)), \
+             patch.object(ea, "analyze_audio", side_effect=fake_analyze), \
+             patch.object(ea, "analyze_style", side_effect=lambda p: {"track_genres": [], "genre_affinity": {}, "vocalness": 5}):
+            tid, result = self._run(ea.analyze_track_full(
+                TRACK_ID, TRACK_URL, "Mix", "DJ", asyncio.Semaphore(1),
+                duration_ms=76 * 60 * 1000,
+            ))
+        assert result["analysis_excerpt"] is True
+        assert analyzed_paths == [excerpt]          # BPM ran on the excerpt
+        assert not excerpt.exists()                  # temp cleaned up
 
     def test_unavailable_becomes_permanent_not_found_error(self, audio_dir, monkeypatch):
         """The 30-tracks-reanalyzed-on-every-refresh bug: unavailable tracks

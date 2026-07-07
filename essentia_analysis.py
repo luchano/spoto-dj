@@ -210,6 +210,46 @@ def _ensure_dir(path: Path):
 # generic download failure which is retried on the next run.
 UNAVAILABLE = "UNAVAILABLE"
 
+# Tracks longer than this are analyzed via a mid-track EXCERPT instead of the
+# full file: essentia's RhythmExtractor2013 overflows its internal onset
+# buffers on very long audio (a 76-min continuous mix fails deterministically
+# with "While trying to push item into source OnsetDetectionGlobal"), and a
+# full decode costs ~10 MB RAM per minute anyway.
+EXCERPT_THRESHOLD_MS = 20 * 60 * 1000   # 20 min
+EXCERPT_SECONDS      = 600              # analyze 10 min from the middle
+
+
+def _maybe_excerpt(audio_path: Path, duration_ms: int):
+    """
+    Return (path_to_analyze, cleanup_path). For long tracks, decode a 10-min
+    excerpt centered in the file with ffmpeg to a temp wav; otherwise return
+    the original path. cleanup_path is the temp file to delete afterwards
+    (None when analyzing the original).
+    """
+    if duration_ms <= EXCERPT_THRESHOLD_MS:
+        return audio_path, None
+
+    import shutil
+    import tempfile
+    ffmpeg = shutil.which("ffmpeg") or "/opt/homebrew/bin/ffmpeg"
+    start_s = max(0, duration_ms / 1000 / 2 - EXCERPT_SECONDS / 2)
+    tmp = Path(tempfile.mktemp(suffix=".wav"))
+    try:
+        proc = subprocess.run(
+            [ffmpeg, "-y", "-v", "quiet",
+             "-ss", str(int(start_s)), "-t", str(EXCERPT_SECONDS),
+             "-i", str(audio_path), "-ac", "1", str(tmp)],
+            capture_output=True, timeout=300,
+        )
+        if proc.returncode == 0 and tmp.exists() and tmp.stat().st_size > 0:
+            log.info("Analyzing %s via %ss excerpt (track is %.0f min)",
+                     audio_path.name, EXCERPT_SECONDS, duration_ms / 60000)
+            return tmp, tmp
+    except Exception as e:
+        log.warning("Excerpt extraction failed for %s: %s", audio_path, e)
+    tmp.unlink(missing_ok=True)
+    return audio_path, None   # fall back to the full file
+
 
 def _find_downloaded(track_id: str) -> Optional[Path]:
     """Return the cached audio file for a track, if any."""
@@ -786,28 +826,41 @@ async def analyze_track_full(
         if not audio_path:
             return track_id, {"error": f"audio download failed for '{title}'"}
 
-        # Analyze BPM / key / energy
-        _stage("analyzing")
+        # Very long tracks (continuous mixes) are analyzed via an excerpt —
+        # essentia's rhythm extractor breaks on them and they'd cost ~800 MB.
+        # The excerpt (when any) is reused for BOTH audio and style inference,
+        # and cleaned up at the end.
+        analysis_path, cleanup = await loop.run_in_executor(
+            None, _maybe_excerpt, audio_path, duration_ms,
+        )
         try:
-            result = await loop.run_in_executor(None, analyze_audio, audio_path)
-        except Exception as e:
-            return track_id, {"error": f"essentia analysis failed: {e}"}
-
-        result["source"] = "local"
-
-        # Style inference: genres + per-cluster affinity + vocalness,
-        # all from one EffNet pass (optional, skip if models absent)
-        if not skip_genre:
+            # Analyze BPM / key / energy
+            _stage("analyzing")
             try:
-                style = await loop.run_in_executor(None, analyze_style, audio_path)
+                result = await loop.run_in_executor(None, analyze_audio, analysis_path)
             except Exception as e:
-                log.warning("Style inference error for '%s': %s", title, e)
-                style = {}
-            result["track_genres"]   = style.get("track_genres", [])
-            result["genre_affinity"] = style.get("genre_affinity", {})
-            result["style_version"]  = style.get("style_version", 0)
-            if style.get("vocalness") is not None:
-                result["vocalness"] = style["vocalness"]
+                return track_id, {"error": f"essentia analysis failed: {e}"}
+            if cleanup is not None:
+                result["analysis_excerpt"] = True
+
+            result["source"] = "local"
+
+            # Style inference: genres + per-cluster affinity + vocalness,
+            # all from one EffNet pass (optional, skip if models absent)
+            if not skip_genre:
+                try:
+                    style = await loop.run_in_executor(None, analyze_style, analysis_path)
+                except Exception as e:
+                    log.warning("Style inference error for '%s': %s", title, e)
+                    style = {}
+                result["track_genres"]   = style.get("track_genres", [])
+                result["genre_affinity"] = style.get("genre_affinity", {})
+                result["style_version"]  = style.get("style_version", 0)
+                if style.get("vocalness") is not None:
+                    result["vocalness"] = style["vocalness"]
+        finally:
+            if cleanup is not None:
+                cleanup.unlink(missing_ok=True)
 
         log.info(
             "Local analysis OK for '%s': bpm=%.1f key=%s camelot=%s genres=%s vocal=%s",

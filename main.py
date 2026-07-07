@@ -86,7 +86,10 @@ app.mount("/static", StaticFiles(directory=static_dir), name="static")
 
 # Error prefixes that are permanent (not transient) — safe to cache so we don't
 # waste API calls retrying them. Defined at module level so _lookup() can use it.
-_PERMANENT_ERRORS = ("not found", "incomplete data")
+# "essentia analysis failed" is deterministic (corrupt/edge-case audio fails the
+# same way every run) — without caching it, the track re-downloads/re-analyzes
+# on every page refresh forever.
+_PERMANENT_ERRORS = ("not found", "incomplete data", "essentia analysis failed")
 
 
 def _set_session(response, session_id: str, data: dict):
