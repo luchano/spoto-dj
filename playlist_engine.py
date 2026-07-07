@@ -772,6 +772,22 @@ def generate(
             )
             bpm_range = None   # don't clamp section BPM targets either
 
+    return _sequence_pool(pool, duration_min, bpm_range, warnings)
+
+
+def _sequence_pool(
+    pool: list,
+    duration_min: int,
+    bpm_range: Optional[Tuple[int, int]] = None,
+    warnings: Optional[List[str]] = None,
+    max_resets: int = MAX_RESETS_PER_SET,
+) -> dict:
+    """Sequence a prepared pool into a narrative-arc set (beam search core).
+
+    Shared by generate() (which filters the pool by genre/BPM first) and the
+    library-tour planner (which passes pre-partitioned cohesive chunks)."""
+    warnings = warnings if warnings is not None else []
+
     # ── Set-wide parameters ──────────────────────────────────────────────────
     n_tracks = max(5, round(duration_min / 3.75))
     if len(pool) < n_tracks:
@@ -839,7 +855,7 @@ def generate(
                     if cands:
                         break
                 if not cands:
-                    if state["resets"] >= MAX_RESETS_PER_SET:
+                    if state["resets"] >= max_resets:
                         continue   # this beam can't afford another reset — dies
                     cands = next((l for l in _ladders if l), avail)
                     transition = "reset"
@@ -904,6 +920,187 @@ def generate(
         "track_count":       len(selected),
         "warnings":          warnings,
         "sections":          _sections_summary(selected),
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Library tour — partition the WHOLE library into cohesive, disjoint sets
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Small genre clusters merge into these macro-buckets so their leftovers can
+# still form cohesive sets instead of orphan mini-playlists.
+_MACRO_BUCKETS = {
+    "electronic": "electronic", "downtempo": "downtempo", "classical": "downtempo",
+    "rock": "banda", "indie": "banda", "pop": "banda",
+    "hip_hop": "groove", "jazz": "groove",
+    "latin": "raices", "folk": "raices", "world": "raices",
+}
+_BUCKET_LABELS = {
+    "electronic": "Electrónica",
+    "downtempo":  "Calma",
+    "banda":      "Bandas & Pop",
+    "groove":     "Groove",
+    "raices":     "Raíces",
+}
+
+
+def _dominant_cluster(track: dict, cache: dict) -> str:
+    """Single best cluster for partitioning: affinity argmax, tag fallback."""
+    analysis = cache.get(track["id"], {})
+    affinity = analysis.get("genre_affinity") or {}
+    if affinity:
+        return max(affinity, key=affinity.get)
+    clusters = track.get("genre_clusters") or set()
+    return next(iter(clusters), "") or "otros"
+
+
+def _slice_by_duration(tracks: list, min_ms: int, target_ms: int, max_ms: int) -> list:
+    """Split BPM-sorted tracks into chunks of cumulative duration ≈ target.
+
+    The final short tail merges into the previous chunk when it still fits
+    under max_ms; otherwise it stays as a (possibly short) chunk."""
+    chunks, current, cur_ms = [], [], 0
+    for t in tracks:
+        current.append(t)
+        cur_ms += t["duration_ms"]
+        if cur_ms >= target_ms:
+            chunks.append(current)
+            current, cur_ms = [], 0
+    if current:
+        tail_ms = sum(t["duration_ms"] for t in current)
+        if chunks and tail_ms < min_ms:
+            prev_ms = sum(t["duration_ms"] for t in chunks[-1])
+            if prev_ms + tail_ms <= max_ms:
+                chunks[-1].extend(current)
+            else:
+                chunks.append(current)   # short set — flagged by caller
+        else:
+            chunks.append(current)
+    return chunks
+
+
+def plan_library_tour(
+    library: list,
+    cache: dict,
+    min_minutes: int    = 60,
+    target_minutes: int = 110,
+    max_minutes: int    = 180,
+) -> dict:
+    """Partition the entire analyzed library into cohesive, disjoint DJ sets.
+
+    Strategy:
+      1. Group tracks by DOMINANT genre cluster (affinity argmax).
+      2. Groups big enough on their own are split by vocal character when
+         very large (instrumental vs vocal — a validated cohesion axis), then
+         BPM-sorted and sliced into chunks of ~target duration. BPM sorting
+         means each chunk covers a tight tempo band → smooth sequencing.
+      3. Groups too small for one set pool into macro-buckets (Bandas & Pop,
+         Groove, Raíces, Calma) and get the same treatment.
+      4. Every chunk is sequenced with the narrative beam search, using all
+         of its tracks. Sets are mutually disjoint by construction.
+
+    Returns {"sets": [...], "unplaced": [...], "stats": {...}} where each set
+    has {label, cluster, tracks(sequenced result), duration_ms, bpm_lo/hi,
+    count, short(bool)}.
+    """
+    min_ms, target_ms, max_ms = (m * 60_000 for m in (min_minutes, target_minutes, max_minutes))
+    pool = build_pool(library, cache)
+    if not pool:
+        return {"sets": [], "unplaced": [], "stats": {"pool": 0}}
+
+    groups: dict = {}
+    for t in pool:
+        groups.setdefault(_dominant_cluster(t, cache), []).append(t)
+
+    chunk_specs = []   # (label_base, tracks)
+    leftovers: dict = {}
+    for cluster, tracks in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+        total_ms = sum(t["duration_ms"] for t in tracks)
+        if total_ms < min_ms:
+            bucket = _MACRO_BUCKETS.get(cluster, "raices")
+            leftovers.setdefault(bucket, []).extend(tracks)
+            continue
+
+        label_base = GENRE_LABELS.get(cluster, cluster.title())
+        # Very large groups: split along the validated vocal-cohesion axis
+        # first so vocal and instrumental sets don't interleave.
+        if total_ms > 2.2 * target_ms:
+            instrumental = [t for t in tracks if (t.get("vocalness") or 50) < 45]
+            vocal        = [t for t in tracks if (t.get("vocalness") or 50) >= 45]
+            bands = []
+            if sum(t["duration_ms"] for t in instrumental) >= min_ms and \
+               sum(t["duration_ms"] for t in vocal) >= min_ms:
+                bands = [(f"{label_base} instrumental", instrumental),
+                         (f"{label_base} vocal", vocal)]
+            else:
+                bands = [(label_base, tracks)]
+        else:
+            bands = [(label_base, tracks)]
+
+        for band_label, band_tracks in bands:
+            band_tracks.sort(key=lambda t: t["bpm"])
+            for chunk in _slice_by_duration(band_tracks, min_ms, target_ms, max_ms):
+                chunk_specs.append((band_label, chunk))
+
+    # Macro-bucket leftovers get the same slicing.
+    for bucket, tracks in leftovers.items():
+        total_ms = sum(t["duration_ms"] for t in tracks)
+        label = _BUCKET_LABELS.get(bucket, bucket.title())
+        if total_ms < min_ms and chunk_specs:
+            # Too small even pooled — ride along with the closest-BPM chunk
+            # that still has room, else stand alone as a short set.
+            for t in sorted(tracks, key=lambda x: x["bpm"]):
+                host = min(
+                    (spec for spec in chunk_specs
+                     if sum(x["duration_ms"] for x in spec[1]) + t["duration_ms"] <= max_ms),
+                    key=lambda spec: abs(compute_base_bpm(spec[1]) - t["bpm"]),
+                    default=None,
+                )
+                if host:
+                    host[1].append(t)
+                else:
+                    chunk_specs.append((label, [t]))
+            continue
+        tracks.sort(key=lambda t: t["bpm"])
+        for chunk in _slice_by_duration(tracks, min_ms, target_ms, max_ms):
+            chunk_specs.append((label, chunk))
+
+    # Sequence every chunk with the narrative beam search, using ALL tracks.
+    sets, used_ids = [], set()
+    label_counts: Counter = Counter(lbl for lbl, _ in chunk_specs)
+    label_seen: Counter = Counter()
+    for label_base, chunk in chunk_specs:
+        # duration_min chosen so n_tracks == len(chunk) → every track is used.
+        dur_min = max(5, round(len(chunk) * 3.75))
+        result = _sequence_pool(list(chunk), dur_min, warnings=[], max_resets=2)
+        tracks = result["tracks"]
+        used_ids.update(t["id"] for t in tracks)
+
+        label_seen[label_base] += 1
+        label = (f"{label_base} {label_seen[label_base]}"
+                 if label_counts[label_base] > 1 else label_base)
+        bpms = [t["bpm"] for t in tracks] or [0]
+        sets.append({
+            "label":       label,
+            "result":      result,
+            "count":       len(tracks),
+            "duration_ms": result["total_duration_ms"],
+            "bpm_lo":      round(min(bpms)),
+            "bpm_hi":      round(max(bpms)),
+            "short":       result["total_duration_ms"] < min_ms,
+        })
+
+    unplaced = [t for t in pool if t["id"] not in used_ids]
+    return {
+        "sets": sets,
+        "unplaced": [{"id": t["id"], "title": t["title"], "artists": t["artists"]}
+                     for t in unplaced],
+        "stats": {
+            "pool":     len(pool),
+            "placed":   len(pool) - len(unplaced),
+            "sets":     len(sets),
+            "total_ms": sum(s["duration_ms"] for s in sets),
+        },
     }
 
 

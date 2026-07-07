@@ -19,7 +19,7 @@ from getsongbpm import lookup_track, QUOTA_EXCEEDED as _GETSONGBPM_QUOTA
 from lastfm import lookup_track_tags as _lastfm_tags
 from playlist_engine import (
     create_playlist, delete_playlist, generate as generate_playlist,
-    genre_options, load_playlists, save_playlists,
+    genre_options, load_playlists, plan_library_tour, save_playlists,
 )
 from set_namer import generate_set_name
 from spotify import build_track_library
@@ -609,6 +609,62 @@ async def api_generate_playlist(request: Request, background_tasks: BackgroundTa
         )
 
     return JSONResponse(playlist)
+
+
+@app.post("/api/playlists/tour")
+async def api_library_tour(request: Request, background_tasks: BackgroundTasks):
+    """Partition the WHOLE analyzed library into cohesive, disjoint DJ sets.
+
+    Body: {"dry_run": true} returns the proposed plan without creating
+    anything; {"dry_run": false} creates every set (AI names arrive in the
+    background, one by one)."""
+    session = _get_session(request)
+    access_token = session.get("access_token")
+    if not access_token:
+        raise HTTPException(401, "Not authenticated")
+    library = _track_cache.get(access_token, [])
+    if not library:
+        raise HTTPException(400, "Load tracks first via /api/tracks")
+
+    body = await request.json()
+    dry_run = bool(body.get("dry_run", True))
+
+    plan = plan_library_tour(library, load_cache())
+    if not plan["sets"]:
+        raise HTTPException(400, "No analysed tracks to build a tour from.")
+
+    summary = [
+        {
+            "label":        s["label"],
+            "count":        s["count"],
+            "duration_ms":  s["duration_ms"],
+            "bpm_lo":       s["bpm_lo"],
+            "bpm_hi":       s["bpm_hi"],
+            "short":        s["short"],
+            "sample":       [f'{t["title"]} — {t["artists"]}'
+                             for t in s["result"]["tracks"][:3]],
+        }
+        for s in plan["sets"]
+    ]
+    if dry_run:
+        return JSONResponse({"dry_run": True, "sets": summary, "stats": plan["stats"],
+                             "unplaced": plan["unplaced"]})
+
+    created = []
+    for s in plan["sets"]:
+        params = {"tour": True, "duration_min": round(s["duration_ms"] / 60000),
+                  "genre_filter": None, "bpm_range": None}
+        pl = create_playlist(s["result"], params, name=s["label"])
+        created.append({"id": pl["id"], "name": pl["name"]})
+        # AI flavor name lands later, one set at a time (sequential background)
+        background_tasks.add_task(
+            _ai_rename_playlist, pl["id"],
+            {"tracks": s["result"]["tracks"],
+             "total_duration_ms": s["duration_ms"], "params": params},
+        )
+    log.info("Library tour created: %d sets, %d tracks placed",
+             len(created), plan["stats"]["placed"])
+    return JSONResponse({"dry_run": False, "created": created, "stats": plan["stats"]})
 
 
 @app.get("/api/playlists/{pid}")

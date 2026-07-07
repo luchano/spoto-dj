@@ -38,9 +38,11 @@ from playlist_engine import (
     generate,
     genre_options,
     load_playlists,
+    plan_library_tour,
     save_playlists,
     score_candidate,
     tags_to_clusters,
+    tempo_distance_pct,
 )
 
 
@@ -549,6 +551,77 @@ class TestClusterMembership:
     def test_legacy_entry_falls_back_to_tags(self):
         from playlist_engine import cluster_membership
         assert "electronic" in cluster_membership({}, ["Tech House"])
+
+
+class TestLibraryTour:
+    def _library(self, n=200):
+        """Varied library: several genre communities with distinct BPM bands."""
+        lib = []
+        genres_cycle = [
+            (["Tech House", "Electronic"], 118, 12),
+            (["Deep House", "Electronic"], 108, 30),
+            (["Indie Rock", "Rock"], 95, 40),
+            (["Boom Bap", "Hip Hop"], 82, 15),
+            (["Folk", "Acoustic"], 75, 20),
+        ]
+        for i in range(n):
+            tags, base, jitter = genres_cycle[i % len(genres_cycle)]
+            lib.append(_track(
+                tid=f"t{i}", title=f"T{i}", artists=f"A{i % 17}",
+                bpm=base + (i * 7) % jitter,
+                camelot=["8A", "9A", "8B", "5A", "12A"][i % 5],
+                energy=25 + (i * 13) % 70,
+                duration_ms=180_000 + (i % 5) * 30_000,
+                genres=tags,
+            ))
+        return lib
+
+    def _cache(self, lib):
+        cache = {}
+        for i, t in enumerate(lib):
+            cache[t["id"]] = {
+                "bpm": t["bpm"], "camelot": t["camelot"], "energy": t["energy"],
+                "track_genres": t["genres"], "vocalness": (i * 29) % 100,
+            }
+        return cache
+
+    def test_sets_are_disjoint(self):
+        lib = self._library(); cache = self._cache(lib)
+        plan = plan_library_tour(lib, cache)
+        seen = set()
+        for s in plan["sets"]:
+            ids = {t["id"] for t in s["result"]["tracks"]}
+            assert not (ids & seen), "track repetido entre sets"
+            seen |= ids
+
+    def test_full_coverage(self):
+        lib = self._library(); cache = self._cache(lib)
+        plan = plan_library_tour(lib, cache)
+        assert plan["stats"]["placed"] == plan["stats"]["pool"]
+        assert plan["unplaced"] == []
+
+    def test_duration_bounds(self):
+        lib = self._library(300); cache = self._cache(lib)
+        plan = plan_library_tour(lib, cache, min_minutes=60, max_minutes=180)
+        for s in plan["sets"]:
+            minutes = s["duration_ms"] / 60000
+            if not s["short"]:
+                # overlap discount (15s/transition) can dip slightly under 60
+                assert 50 <= minutes <= 185, f"{s['label']}: {minutes:.0f}min"
+
+    def test_transitions_hold_within_sets(self):
+        lib = self._library(); cache = self._cache(lib)
+        plan = plan_library_tour(lib, cache)
+        for s in plan["sets"]:
+            tracks = s["result"]["tracks"]
+            for a, b in zip(tracks, tracks[1:]):
+                if b.get("transition") == "reset":
+                    continue
+                assert tempo_distance_pct(a["bpm"], b["bpm"]) <= 0.081
+
+    def test_empty_library(self):
+        plan = plan_library_tour([], {})
+        assert plan["sets"] == []
 
 
 class TestVerifyFindings:

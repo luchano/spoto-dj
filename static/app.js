@@ -428,6 +428,72 @@ async function generatePlaylist() {
   }
 }
 
+// ── Library tour: partition the whole library into cohesive sets ────────────
+
+async function proposeTour() {
+  const btn = document.getElementById("pl-tour-btn");
+  const box = document.getElementById("pl-tour-proposal");
+  btn.disabled = true;
+  box.style.display = "";
+  box.innerHTML = '<p class="muted">Armando la propuesta del tour…</p>';
+  try {
+    const res = await fetch("/api/playlists/tour", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({dry_run: true}),
+    });
+    const data = await res.json();
+    if (!res.ok) { box.innerHTML = `<p class="muted">Error: ${data.detail}</p>`; return; }
+
+    const hours = (data.stats.total_ms / 3600000).toFixed(1);
+    const rows = data.sets.map(s => {
+      const min = Math.round(s.duration_ms / 60000);
+      const flag = s.short ? " ⚠" : "";
+      return `<tr><td>${s.label}${flag}</td><td>${s.count}</td>` +
+             `<td>${min}min</td><td>${s.bpm_lo}–${s.bpm_hi}</td>` +
+             `<td class="muted">${s.sample[0] || ""}</td></tr>`;
+    }).join("");
+    const unplaced = data.unplaced.length
+      ? `<p class="muted">Sin ubicar: ${data.unplaced.length}</p>` : "";
+    box.innerHTML = `
+      <h3>Propuesta: ${data.sets.length} sets · ${data.stats.placed}/${data.stats.pool} temas · ${hours}h</h3>
+      <div class="table-wrap" style="max-height:320px;overflow-y:auto">
+        <table><thead><tr><th>Set</th><th>Temas</th><th>Duración</th><th>BPM</th><th>Abre con</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      </div>
+      ${unplaced}
+      <button class="btn-primary" onclick="createTour(this)">Crear estos ${data.sets.length} sets</button>
+      <button class="btn-ghost" onclick="document.getElementById('pl-tour-proposal').style.display='none'">Cancelar</button>
+      <p class="muted" style="margin-top:6px">Los nombres creativos (IA) van llegando en segundo plano después de crear.</p>
+    `;
+  } catch (e) {
+    box.innerHTML = `<p class="muted">Error: ${e.message}</p>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function createTour(btn) {
+  btn.disabled = true;
+  btn.textContent = "Creando sets…";
+  try {
+    const res = await fetch("/api/playlists/tour", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({dry_run: false}),
+    });
+    const data = await res.json();
+    if (!res.ok) { btn.textContent = `Error: ${data.detail}`; return; }
+    document.getElementById("pl-tour-proposal").innerHTML =
+      `<p>✓ ${data.created.length} sets creados (${data.stats.placed} temas). ` +
+      `Los nombres con IA van llegando solos.</p>`;
+    await loadPlaylists();
+  } catch (e) {
+    btn.textContent = `Error: ${e.message}`;
+    btn.disabled = false;
+  }
+}
+
 function watchAiRename(pid, originalName, attempt = 0) {
   if (attempt >= 8) return;          // ~2 min, then give up quietly
   setTimeout(async () => {
