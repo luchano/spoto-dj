@@ -141,7 +141,11 @@
 
       <!-- Saved playlists list -->
       <div id="pl-list-wrap">
-        <h2 style="margin:24px 0 12px">Saved Sets</h2>
+        <div style="display:flex;align-items:center;gap:16px;margin:24px 0 12px">
+          <h2 style="margin:0">Saved Sets</h2>
+          <button class="btn-ghost small" id="pl-export-all-btn" onclick="exportAllPlaylists()">Exportar todas a Spotify</button>
+          <span id="pl-export-all-status" class="muted"></span>
+        </div>
         <div id="pl-list"></div>
       </div>
 
@@ -175,6 +179,6 @@
     <p class="muted">BPM &amp; key data powered by <a href="https://getsongbpm.com" target="_blank" rel="noopener">GetSongBPM</a></p>
   </footer>
 
-  <script src="/static/app.js?v=12"></script>
+  <script src="/static/app.js?v=13"></script>
 </body>
 </html>

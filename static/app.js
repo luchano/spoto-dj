@@ -494,6 +494,27 @@ async function createTour(btn) {
   }
 }
 
+async function exportAllPlaylists() {
+  const btn = document.getElementById("pl-export-all-btn");
+  const status = document.getElementById("pl-export-all-status");
+  btn.disabled = true;
+  status.textContent = "Exportando… (puede tardar ~1 min)";
+  try {
+    const res = await fetch("/api/playlists/export-all", {method: "POST"});
+    const data = await res.json();
+    if (!res.ok) { status.textContent = `Error: ${data.detail}`; return; }
+    const parts = [`✓ ${data.exported.length} exportadas`];
+    if (data.skipped) parts.push(`${data.skipped} ya estaban`);
+    if (data.failed.length) parts.push(`⚠ ${data.failed.length} fallaron`);
+    status.textContent = parts.join(" · ");
+    await loadPlaylists();
+  } catch (e) {
+    status.textContent = `Error: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function watchAiRename(pid, originalName, attempt = 0) {
   if (attempt >= 8) return;          // ~2 min, then give up quietly
   setTimeout(async () => {
