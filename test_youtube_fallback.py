@@ -37,7 +37,44 @@ def reset_analysis_state():
     m._analysis_state.update(blank)
 
 
+@pytest.fixture(autouse=True)
+def force_legacy_analysis(monkeypatch):
+    """These tests exercise the GetSongBPM + YouTube fallback path, which only
+    runs when USE_LOCAL_ANALYSIS is off. Pin it so the suite is deterministic
+    even when the operator has local (zotify/essentia) analysis enabled in .env."""
+    import main as m
+    monkeypatch.setattr(m, "USE_LOCAL_ANALYSIS", False)
+
+
 # ── UNIT: fallback logic in main._run_analysis ────────────────────────────────
+
+async def test_cache_saved_after_every_track():
+    """The slow local pipeline is often interrupted, so the cache must be
+    persisted per-track, not only at a coarse 50-track checkpoint or at the end.
+    """
+    import main as m
+
+    tracks = [
+        {"id": f"t{i}", "title": f"T{i}", "artists": "A", "album": ""}
+        for i in range(3)
+    ]
+    hit = {"bpm": 120, "key": "A min", "camelot": "8A", "energy": 60}
+
+    async def fake_lookup(_key, tid, *a, **k):
+        return tid, dict(hit)
+
+    with (
+        patch("main.lookup_track", new=AsyncMock(side_effect=fake_lookup)),
+        patch("main._lastfm_tags", new=AsyncMock(return_value=[])),
+        patch("main.save_cache") as mock_save,
+    ):
+        cache = {}
+        await m._run_analysis(tracks, [], cache)
+
+    # One save per track (3) plus the final save — comfortably more than 1.
+    assert mock_save.call_count >= len(tracks), mock_save.call_count
+    assert set(cache) == {"t0", "t1", "t2"}
+
 
 async def test_youtube_fallback_called_on_not_found():
     """

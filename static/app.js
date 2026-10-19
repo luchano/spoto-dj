@@ -3,6 +3,7 @@ let filtered = [];
 let sortCol = "added_at";
 let sortDir = -1;
 let pollTimer = null;
+let pollCount = 0;
 let canExport = false;          // true when spotify_user_id is available
 let currentPlaylistId = null;   // id of the playlist shown in detail view
 let genreLabels = {};           // cluster value -> human label (from /api/playlists/genres)
@@ -123,12 +124,18 @@ async function pollAnalysis() {
   applyAnalysisResults(data.results);
   const pct = data.total > 0 ? Math.round((data.done / data.total) * 100) : 100;
   setBannerMsg(`Analizando… ${data.done} / ${data.total} canciones`, pct);
+  setBannerDetail(data.current, data.last_done, data.rate);
+
+  // Long runs take hours — refresh the DJ-set genre dropdown as clusters
+  // cross the minimum-track threshold, not only at the very end.
+  if (++pollCount % 30 === 0) populateGenreFilter();
 
   if (!data.running && !data.backfilling) {
     clearInterval(pollTimer);
     pollTimer = null;
     setRefreshBtn(false);
     setBannerMsg(`Metadatos cargados: ${Object.keys(data.results).length} canciones`, 100);
+    setBannerDetail(null, data.last_done);
     setTimeout(() => { document.getElementById("analysis-banner").style.display = "none"; }, 3000);
     const sel = document.getElementById("key-filter");
     sel.innerHTML = '<option value="">All keys</option>';
@@ -139,18 +146,50 @@ async function pollAnalysis() {
   }
 }
 
+function setBannerDetail(current, lastDone, rate) {
+  const el = document.getElementById("analysis-detail");
+  if (!el) return;
+  const parts = [];
+  if (current) {
+    const m = Math.floor((current.elapsed || 0) / 60);
+    const s = String((current.elapsed || 0) % 60).padStart(2, "0");
+    const verb = current.stage === "analyzing" ? "🎧 Analizando" : "⬇️ Descargando";
+    parts.push(`${verb} <strong>${current.title}</strong> — ${current.artists} · ${m}:${s}`);
+  }
+  if (lastDone && lastDone.title) {
+    const bpm = lastDone.bpm ? ` (${lastDone.bpm} BPM)` : "";
+    parts.push(`✓ Última: <strong>${lastDone.title}</strong>${bpm}`);
+  }
+  if (rate && rate.effective != null) {
+    // Escalated by the ban-risk watchdog → warn; otherwise just inform.
+    if (rate.escalation_level > 0) {
+      parts.push(`⚠️ ritmo <strong>${rate.effective}x</strong> (auto-frenado desde ${rate.base}x, ${rate.signals} señales)`);
+    } else {
+      parts.push(`⚙️ ritmo ${rate.effective}x`);
+    }
+  }
+  el.innerHTML = parts.join("&nbsp;&nbsp;·&nbsp;&nbsp;");
+}
+
 function applyAnalysisResults(results) {
   if (!results || !Object.keys(results).length) return;
   let changed = false;
   allTracks.forEach(t => {
     const r = results[t.id];
     if (!r || r.error) return;
-    if (t.bpm === 0) {
-      t.bpm = r.bpm; t.key = r.key; t.camelot = r.camelot; t.energy = r.energy;
-      changed = true;
-    }
-    // Keep Last.fm track tags in a separate field so Spotify artist genres and
-    // Last.fm track genres can be displayed side by side.
+    // Analysis results are authoritative — apply whenever present, not only
+    // when bpm is still 0. This lets a re-analysis (e.g. recalibrated energy)
+    // overwrite older cached values instead of being blocked by the old gate.
+    const set = (field, val) => {
+      if (val != null && t[field] !== val) { t[field] = val; changed = true; }
+    };
+    if (r.bpm) { set("bpm", r.bpm); set("key", r.key); set("camelot", r.camelot); }
+    set("energy", r.energy);
+    // essentia also fills these (Spotify's audio features 403 on new apps)
+    set("danceability", r.danceability);
+    set("loudness", r.loudness);
+    // Track-level analyzed genres (essentia in local mode, Last.fm in legacy)
+    // kept separate from Spotify artist genres so both show side by side.
     if (r.track_genres && r.track_genres.length) {
       t.track_genres = r.track_genres;
       changed = true;
@@ -379,11 +418,123 @@ async function generatePlaylist() {
     await loadPlaylists();
     // Auto-open the new set
     openPLDetail(data.id);
+    // The AI name arrives ~40-90s later (background rename on the server) —
+    // poll a few times and refresh the UI when it lands.
+    if (!body.name) watchAiRename(data.id, data.name);
   } catch (e) {
     status.textContent = `Error: ${e.message}`;
   } finally {
     btn.disabled = false;
   }
+}
+
+// ── Library tour: partition the whole library into cohesive sets ────────────
+
+async function proposeTour() {
+  const btn = document.getElementById("pl-tour-btn");
+  const box = document.getElementById("pl-tour-proposal");
+  btn.disabled = true;
+  box.style.display = "";
+  box.innerHTML = '<p class="muted">Armando la propuesta del tour…</p>';
+  try {
+    const res = await fetch("/api/playlists/tour", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({dry_run: true}),
+    });
+    const data = await res.json();
+    if (!res.ok) { box.innerHTML = `<p class="muted">Error: ${data.detail}</p>`; return; }
+
+    const hours = (data.stats.total_ms / 3600000).toFixed(1);
+    const rows = data.sets.map(s => {
+      const min = Math.round(s.duration_ms / 60000);
+      const flag = s.short ? " ⚠" : "";
+      return `<tr><td>${s.label}${flag}</td><td>${s.count}</td>` +
+             `<td>${min}min</td><td>${s.bpm_lo}–${s.bpm_hi}</td>` +
+             `<td class="muted">${s.sample[0] || ""}</td></tr>`;
+    }).join("");
+    const unplaced = data.unplaced.length
+      ? `<p class="muted">Sin ubicar: ${data.unplaced.length}</p>` : "";
+    box.innerHTML = `
+      <h3>Propuesta: ${data.sets.length} sets · ${data.stats.placed}/${data.stats.pool} temas · ${hours}h</h3>
+      <div class="table-wrap" style="max-height:320px;overflow-y:auto">
+        <table><thead><tr><th>Set</th><th>Temas</th><th>Duración</th><th>BPM</th><th>Abre con</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      </div>
+      ${unplaced}
+      <button class="btn-primary" onclick="createTour(this)">Crear estos ${data.sets.length} sets</button>
+      <button class="btn-ghost" onclick="document.getElementById('pl-tour-proposal').style.display='none'">Cancelar</button>
+      <p class="muted" style="margin-top:6px">Los nombres creativos (IA) van llegando en segundo plano después de crear.</p>
+    `;
+  } catch (e) {
+    box.innerHTML = `<p class="muted">Error: ${e.message}</p>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function createTour(btn) {
+  btn.disabled = true;
+  btn.textContent = "Creando sets…";
+  try {
+    const res = await fetch("/api/playlists/tour", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({dry_run: false}),
+    });
+    const data = await res.json();
+    if (!res.ok) { btn.textContent = `Error: ${data.detail}`; return; }
+    document.getElementById("pl-tour-proposal").innerHTML =
+      `<p>✓ ${data.created.length} sets creados (${data.stats.placed} temas). ` +
+      `Los nombres con IA van llegando solos.</p>`;
+    await loadPlaylists();
+  } catch (e) {
+    btn.textContent = `Error: ${e.message}`;
+    btn.disabled = false;
+  }
+}
+
+async function exportAllPlaylists() {
+  const btn = document.getElementById("pl-export-all-btn");
+  const status = document.getElementById("pl-export-all-status");
+  btn.disabled = true;
+  status.textContent = "Exportando… (puede tardar ~1 min)";
+  try {
+    const res = await fetch("/api/playlists/export-all", {method: "POST"});
+    const data = await res.json();
+    if (!res.ok) { status.textContent = `Error: ${data.detail}`; return; }
+    const parts = [`✓ ${data.exported.length} exportadas`];
+    if (data.skipped) parts.push(`${data.skipped} ya estaban`);
+    if (data.failed.length) parts.push(`⚠ ${data.failed.length} fallaron`);
+    status.textContent = parts.join(" · ");
+    await loadPlaylists();
+  } catch (e) {
+    status.textContent = `Error: ${e.message}`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function watchAiRename(pid, originalName, attempt = 0) {
+  if (attempt >= 8) return;          // ~2 min, then give up quietly
+  setTimeout(async () => {
+    try {
+      const res = await fetch(`/api/playlists/${pid}`);
+      if (!res.ok) return;
+      const p = await res.json();
+      if (p.name && p.name !== originalName) {
+        // Rename landed: refresh list, detail header (if open) and status.
+        loadPlaylists();
+        if (currentPlaylistId === pid) {
+          document.getElementById("pl-detail-name").textContent = p.name;
+        }
+        const status = document.getElementById("pl-gen-status");
+        if (status) status.textContent = `✨ "${p.name}"`;
+        return;
+      }
+    } catch (e) { /* keep polling */ }
+    watchAiRename(pid, originalName, attempt + 1);
+  }, 15000);
 }
 
 async function loadPlaylists() {

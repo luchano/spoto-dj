@@ -38,9 +38,11 @@ from playlist_engine import (
     generate,
     genre_options,
     load_playlists,
+    plan_library_tour,
     save_playlists,
     score_candidate,
     tags_to_clusters,
+    tempo_distance_pct,
 )
 
 
@@ -521,6 +523,268 @@ class TestScoreCandidate:
 # Core generator
 # ─────────────────────────────────────────────────────────────────────────────
 
+class TestClusterMembership:
+    """Affinity-based genre membership (the fix for weak-tag intruders)."""
+
+    def test_affinity_dominant_cluster_passes(self):
+        from playlist_engine import cluster_membership
+        analysis = {"genre_affinity": {"electronic": 2.31, "downtempo": 0.07}}
+        assert "electronic" in cluster_membership(analysis, [])
+
+    def test_weak_affinity_excluded_reflection_case(self):
+        """Real fixture: Reflection (neoclassical piano) had classical 0.80
+        dominant and electronic 0.29 — it must NOT be in the electronic pool."""
+        from playlist_engine import cluster_membership
+        analysis = {"genre_affinity": {
+            "classical": 0.8038, "jazz": 0.3849, "electronic": 0.2942, "downtempo": 0.1397,
+        }}
+        clusters = cluster_membership(analysis, ["Electronic"])
+        assert "electronic" not in clusters
+        assert "classical" in clusters
+
+    def test_genuine_house_stays_in(self):
+        """Londonbeat: electronic 1.96 dominant — genre-wise it IS house."""
+        from playlist_engine import cluster_membership
+        analysis = {"genre_affinity": {"electronic": 1.9631, "jazz": 0.2741, "pop": 0.2702}}
+        assert "electronic" in cluster_membership(analysis, [])
+
+    def test_legacy_entry_falls_back_to_tags(self):
+        from playlist_engine import cluster_membership
+        assert "electronic" in cluster_membership({}, ["Tech House"])
+
+
+class TestLibraryTour:
+    def _library(self, n=200):
+        """Varied library: several genre communities with distinct BPM bands."""
+        lib = []
+        genres_cycle = [
+            (["Tech House", "Electronic"], 118, 12),
+            (["Deep House", "Electronic"], 108, 30),
+            (["Indie Rock", "Rock"], 95, 40),
+            (["Boom Bap", "Hip Hop"], 82, 15),
+            (["Folk", "Acoustic"], 75, 20),
+        ]
+        for i in range(n):
+            tags, base, jitter = genres_cycle[i % len(genres_cycle)]
+            lib.append(_track(
+                tid=f"t{i}", title=f"T{i}", artists=f"A{i % 17}",
+                bpm=base + (i * 7) % jitter,
+                camelot=["8A", "9A", "8B", "5A", "12A"][i % 5],
+                energy=25 + (i * 13) % 70,
+                duration_ms=180_000 + (i % 5) * 30_000,
+                genres=tags,
+            ))
+        return lib
+
+    def _cache(self, lib):
+        cache = {}
+        for i, t in enumerate(lib):
+            cache[t["id"]] = {
+                "bpm": t["bpm"], "camelot": t["camelot"], "energy": t["energy"],
+                "track_genres": t["genres"], "vocalness": (i * 29) % 100,
+            }
+        return cache
+
+    def test_sets_are_disjoint(self):
+        lib = self._library(); cache = self._cache(lib)
+        plan = plan_library_tour(lib, cache)
+        seen = set()
+        for s in plan["sets"]:
+            ids = {t["id"] for t in s["result"]["tracks"]}
+            assert not (ids & seen), "track repetido entre sets"
+            seen |= ids
+
+    def test_full_coverage(self):
+        lib = self._library(); cache = self._cache(lib)
+        plan = plan_library_tour(lib, cache)
+        assert plan["stats"]["placed"] == plan["stats"]["pool"]
+        assert plan["unplaced"] == []
+
+    def test_duration_bounds(self):
+        lib = self._library(300); cache = self._cache(lib)
+        plan = plan_library_tour(lib, cache, min_minutes=60, max_minutes=180)
+        for s in plan["sets"]:
+            minutes = s["duration_ms"] / 60000
+            if not s["short"]:
+                # overlap discount (15s/transition) can dip slightly under 60
+                assert 50 <= minutes <= 185, f"{s['label']}: {minutes:.0f}min"
+
+    def test_transitions_hold_within_sets(self):
+        lib = self._library(); cache = self._cache(lib)
+        plan = plan_library_tour(lib, cache)
+        for s in plan["sets"]:
+            tracks = s["result"]["tracks"]
+            for a, b in zip(tracks, tracks[1:]):
+                if b.get("transition") == "reset":
+                    continue
+                assert tempo_distance_pct(a["bpm"], b["bpm"]) <= 0.081
+
+    def test_empty_library(self):
+        plan = plan_library_tour([], {})
+        assert plan["sets"] == []
+
+
+class TestVerifyFindings:
+    """Regression tests for the adversarial-review findings."""
+
+    def test_string_year_from_spotify_does_not_crash_generate(self):
+        """spotify.py stores year as STRING ('2019' or '?') — generate() must
+        coerce, not TypeError on the era comparison (critical finding)."""
+        lib = _make_library(30)
+        for i, t in enumerate(lib):
+            t["year"] = "2019" if i % 2 == 0 else "?"   # library-shaped strings
+        cache = _make_cache(lib)
+        r = generate(lib, cache, duration_min=40)
+        assert r["track_count"] > 0
+
+    def test_build_pool_coerces_year(self):
+        lib = [dict(_track(tid="a"), year="2021"), dict(_track(tid="b"), year="?")]
+        cache = _make_cache(lib)
+        pool = build_pool(lib, cache)
+        years = {t["id"]: t["year"] for t in pool}
+        assert years["a"] == 2021 and years["b"] == 0
+
+    def test_low_affinity_falls_back_to_tags(self):
+        """Boundary inversion: affinity below every threshold must behave like
+        no-affinity (tag fallback), not like empty membership."""
+        from playlist_engine import cluster_membership
+        analysis = {"genre_affinity": {"electronic": 0.09}}   # under MIN_ABS
+        assert "electronic" in cluster_membership(analysis, ["Tech House"])
+
+    def test_missing_style_data_not_rewarded(self):
+        """Single-scale scoring: a candidate WITH matching vocalness must beat
+        an otherwise-identical candidate missing the data (which gets 0.5)."""
+        prev = {"id": "p", "bpm": 122, "camelot": "8A", "energy": 70,
+                "popularity": 50, "artists_list": ["X"], "vocalness": 20, "year": 2022}
+        matching = dict(prev, id="a", artists_list=["A"])
+        missing  = dict(prev, id="b", artists_list=["B"], vocalness=None, year=0)
+        s_match = score_candidate(matching, prev, 0.7, 122, False, set())
+        s_miss  = score_candidate(missing, prev, 0.7, 122, False, set())
+        assert s_match > s_miss
+
+    def test_subgenre_first_attribution(self):
+        """Electronic---Ambient must credit downtempo, NOT electronic — else
+        ambient tracks structurally inflate the electronic cluster."""
+        import essentia_analysis as ea
+        labels = ea._load_genre_labels()
+        if not labels:
+            pytest.skip("labels JSON not downloaded")
+        cmap = ea._label_cluster_map()
+        idx = labels.index("Electronic---Ambient")
+        assert "downtempo" in cmap[idx]
+        assert "electronic" not in cmap[idx]
+        # …while a real electronic subgenre still credits electronic
+        idx2 = labels.index("Electronic---Tech House")
+        assert "electronic" in cmap[idx2]
+
+
+class TestStyleCohesionScoring:
+    def _t(self, **kw):
+        base = {"id": "x", "bpm": 122, "camelot": "8A", "energy": 70,
+                "popularity": 50, "artists_list": ["A"], "vocalness": None, "year": 0}
+        base.update(kw)
+        return base
+
+    def test_vocal_mismatch_penalized(self):
+        prev = self._t(id="p", vocalness=20, year=2022)
+        instrumental = self._t(id="a", vocalness=25, year=2022)
+        vocal        = self._t(id="b", vocalness=92, year=2022)
+        s_i = score_candidate(instrumental, prev, 0.7, 122, False, set())
+        s_v = score_candidate(vocal, prev, 0.7, 122, False, set())
+        assert s_i > s_v
+
+    def test_era_gap_penalized(self):
+        prev = self._t(id="p", vocalness=50, year=2022)
+        modern = self._t(id="a", vocalness=50, year=2021)
+        oldie  = self._t(id="b", vocalness=50, year=1990)
+        assert score_candidate(modern, prev, 0.7, 122, False, set()) > \
+               score_candidate(oldie, prev, 0.7, 122, False, set())
+
+    def test_no_style_data_uses_legacy_weights(self):
+        prev = self._t(id="p")            # vocalness None, year 0
+        cand = self._t(id="a")
+        s = score_candidate(cand, prev, 0.7, 122, False, set())
+        assert s > 0   # doesn't crash, produces sane score
+
+
+class TestTempoPrimitives:
+    def test_tempo_distance_pct_same(self):
+        from playlist_engine import tempo_distance_pct
+        assert tempo_distance_pct(120, 120) == 0.0
+
+    def test_tempo_distance_pct_octave_equivalence(self):
+        """128→64 beatmatches cleanly (half-time mix) — distance must be ~0."""
+        from playlist_engine import tempo_distance_pct
+        assert tempo_distance_pct(128, 64) < 0.01
+        assert tempo_distance_pct(64, 128) < 0.01
+
+    def test_transition_smoothness_asymmetry(self):
+        """Slow-downs are more uncomfortable than speed-ups (Ishizaki)."""
+        from playlist_engine import transition_smoothness
+        assert transition_smoothness(120, 124) > transition_smoothness(120, 116)
+
+    def test_harmonic_score_tiers(self):
+        from playlist_engine import harmonic_score
+        assert harmonic_score("8A", "8A") == 1.0
+        assert harmonic_score("8A", "9A") == 0.8   # +1 same letter
+        assert harmonic_score("8A", "8B") == 0.8   # letter swap
+        assert harmonic_score("8A", "10A") == 0.5  # +2 energy boost
+        assert harmonic_score("8A", "3B") == 0.0
+
+
+class TestTrajectory:
+    def test_slot_targets_are_gradual(self):
+        """Consecutive slot BPM targets must creep (≤3%) on the way up — the
+        interpolated trajectory is what prevents cliff-edge section jumps.
+        The final wind-down after the climax may descend faster (≤8%), which
+        the beam search resolves as a stretch/labeled-reset end-of-set move."""
+        for n in (12, 16, 24):
+            slots = distribute_sections(n, 120)
+            targets = [s.bpm_target for s in slots]
+            peak_idx = targets.index(max(targets))
+            for i, (a, b) in enumerate(zip(slots, slots[1:])):
+                delta_pct = abs(b.bpm_target - a.bpm_target) / a.bpm_target
+                limit = 0.03 if i < peak_idx else 0.08
+                assert delta_pct <= limit, \
+                    f"slots {a.position}->{b.position}: {a.bpm_target}->{b.bpm_target}"
+
+    def test_total_range_bounded(self):
+        """Tempo arc spread should stay within DJ practice (~10-15% of base)."""
+        slots = distribute_sections(16, 120)
+        targets = [s.bpm_target for s in slots]
+        assert max(targets) - min(targets) <= 120 * 0.15
+
+
+class TestTransitionGuarantees:
+    def setup_method(self):
+        self.library = _make_library(60)
+        self.cache   = _make_cache(self.library)
+
+    def test_unlabeled_transitions_are_mixable(self):
+        """Every transition NOT labeled 'reset' must be ≤8% tempo distance —
+        the hard adjacency gate of the beam search."""
+        from playlist_engine import tempo_distance_pct
+        r = generate(self.library, self.cache, duration_min=60)
+        tracks = r["tracks"]
+        for a, b in zip(tracks, tracks[1:]):
+            if b.get("transition") == "reset":
+                continue
+            assert tempo_distance_pct(a["bpm"], b["bpm"]) <= 0.081, \
+                f"{a['bpm']}→{b['bpm']} unlabeled but not mixable"
+
+    def test_reset_budget(self):
+        r = generate(self.library, self.cache, duration_min=90)
+        resets = [t.get("transition") for t in r["tracks"]].count("reset")
+        assert resets <= 1
+
+    def test_transitions_labeled(self):
+        r = generate(self.library, self.cache, duration_min=40)
+        tracks = r["tracks"]
+        assert tracks[0].get("transition") == "open"
+        for t in tracks[1:]:
+            assert t.get("transition") in ("beatmatch", "stretch", "reset")
+
+
 class TestGenerate:
     def setup_method(self):
         self.library = _make_library(40)
@@ -655,7 +919,10 @@ class TestPersistence:
         result = generate(lib, cache, duration_min=30)
         pl = create_playlist(result, {"energy_profile": "peak_time"}, name="My Set")
         assert pl["id"] in load_playlists()
-        assert load_playlists()[pl["id"]]["name"] == "My Set"
+        # `name` is a prefix: "My Set · 30min · <bpm range> · <Mon DD>"
+        stored = load_playlists()[pl["id"]]["name"]
+        assert stored.startswith("My Set")
+        assert "30min" in stored
 
     def test_create_playlist_includes_section_info(self):
         lib    = _make_library(25)
@@ -684,7 +951,8 @@ class TestPersistence:
     def test_create_playlist_auto_name_without_bpm_range(self):
         lib = _make_library(25); cache = _make_cache(lib)
         pl  = create_playlist(generate(lib, cache, duration_min=30), {})
-        assert "DJ Set" in pl["name"]
+        # Auto-name: "<duration>min · <derived bpm range> · <Mon DD>"
+        assert "30min" in pl["name"]
 
     def test_delete_playlist(self):
         lib = _make_library(25); cache = _make_cache(lib)

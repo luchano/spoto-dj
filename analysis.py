@@ -43,7 +43,12 @@ def load_cache() -> dict:
 
 
 def save_cache(cache: dict):
-    CACHE_FILE.write_text(json.dumps(cache))
+    # Atomic write: dump to a temp file in the same dir, then rename. Prevents a
+    # truncated/corrupt cache if the process is killed mid-write — important
+    # because the analysis loop saves after every track.
+    tmp = CACHE_FILE.with_suffix(CACHE_FILE.suffix + ".tmp")
+    tmp.write_text(json.dumps(cache))
+    tmp.replace(CACHE_FILE)
 
 
 def _detect_key(chroma_mean: np.ndarray) -> tuple[int, int]:
