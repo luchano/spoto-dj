@@ -11,3 +11,9 @@ yt-dlp>=2025.1.1
 # The downloader (zotify) is NOT listed here — it needs Python 3.10+ and lives
 # in its own venv (.venv-dl), driven as a subprocess. See essentia_analysis.py.
 essentia-tensorflow>=2.1b6.dev1110
+
+# Test suite. Not needed to run the server, but a venv built from this file
+# alone could not run `.venv/bin/pytest` — the command CLAUDE.md documents.
+# pytest.ini sets asyncio_mode=auto, so pytest-asyncio is required, not optional.
+pytest==8.4.2
+pytest-asyncio==1.2.0
