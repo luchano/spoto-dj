@@ -1,13 +1,17 @@
 #!/usr/bin/env bash
 #
-# dev.sh — start/stop the Spoto DJ development server (uvicorn + --reload).
+# dev.sh — start/stop the Spoto DJ development server (uvicorn, single process).
 #
-#   ./dev.sh start     start in the background, print the clickable URL
-#   ./dev.sh stop      stop it
+#   ./dev.sh           same as `up`
+#   ./dev.sh up        start in the background and open the web UI
+#   ./dev.sh down      stop it
 #   ./dev.sh restart   stop then start
-#   ./dev.sh status    show whether it's running
+#   ./dev.sh logs      follow the server log (live tail)
+#   ./dev.sh status    whether it's running, plus the analysis queue
 #
-# Host/port are overridable:  PORT=8001 ./dev.sh start
+# `start` / `stop` remain as aliases of `up` / `down`.
+#
+# Host/port are overridable:  PORT=8001 ./dev.sh up
 #
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -47,6 +51,9 @@ start() {
   if is_running; then
     echo "Already running (pid $(cat "$PIDFILE"))."
     echo "  →  $URL"
+    # Part of the contract: `up` opens the browser whether or not it had to
+    # start anything.
+    command -v open >/dev/null 2>&1 && open "$URL"
     return 0
   fi
   rm -f "$PIDFILE"
@@ -83,7 +90,7 @@ start() {
       echo ""
       echo "  Ready →  $URL"
       echo ""
-      echo "  logs:  tail -f $LOGFILE   ·   stop:  ./dev.sh stop"
+      echo "  logs:  ./dev.sh logs   ·   stop:  ./dev.sh down"
       command -v open >/dev/null 2>&1 && open "$URL"   # pop the web UI (macOS)
       return 0
     fi
@@ -122,6 +129,15 @@ stop() {
   fi
   rm -f "$PIDFILE"
   [[ "$stopped" -eq 1 ]] && echo "Stopped." || echo "Not running."
+}
+
+logs() {
+  if [[ ! -f "$LOGFILE" ]]; then
+    echo "No log yet at ${LOGFILE} — start the server first:  ./dev.sh up" >&2
+    exit 1
+  fi
+  echo "Tailing ${LOGFILE} — Ctrl-C to stop (the server keeps running)."
+  exec tail -f "$LOGFILE"
 }
 
 queue_status() {
@@ -190,10 +206,11 @@ if r:
   fi
 }
 
-case "${1:-}" in
-  start)   start ;;
-  stop)    stop ;;
-  restart) stop; start ;;
+case "${1:-up}" in
+  up|start)  start ;;
+  down|stop) stop ;;
+  restart)   stop; start ;;
+  logs)      logs ;;
   status)
     if is_running; then
       echo "Running (pid $(cat "$PIDFILE"))  →  $URL"
@@ -202,5 +219,5 @@ case "${1:-}" in
       echo "Not running."
       queue_status   # cache/download counts are still useful when stopped
     fi ;;
-  *) echo "Usage: ./dev.sh {start|stop|restart|status}" >&2; exit 1 ;;
+  *) echo "Usage: ./dev.sh {up|down|restart|logs|status}   (start/stop are aliases)" >&2; exit 1 ;;
 esac
