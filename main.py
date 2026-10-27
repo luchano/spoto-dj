@@ -19,7 +19,7 @@ from getsongbpm import lookup_track, QUOTA_EXCEEDED as _GETSONGBPM_QUOTA
 from lastfm import lookup_track_tags as _lastfm_tags
 from playlist_engine import (
     create_playlist, delete_playlist, generate as generate_playlist,
-    genre_options, load_playlists, plan_library_tour, save_playlists,
+    genre_options, load_playlists, plan_library_tour, plan_nights, save_playlists,
 )
 from set_namer import generate_set_name
 from spotify import build_track_library
@@ -664,6 +664,85 @@ async def api_library_tour(request: Request, background_tasks: BackgroundTasks):
         )
     log.info("Library tour created: %d sets, %d tracks placed",
              len(created), plan["stats"]["placed"])
+    return JSONResponse({"dry_run": False, "created": created, "stats": plan["stats"]})
+
+
+@app.post("/api/playlists/nights")
+async def api_plan_nights(request: Request):
+    """Plan a residency: one progressive set per night, each with its own vibe.
+
+    Body: {"dry_run": true} returns the proposed plan without creating
+    anything; {"dry_run": false} creates one playlist per night.
+
+    Unlike the library tour, these sets are NOT auto-renamed by the AI. The
+    creative name is prepended, which would push "Noche 4" off the front of
+    the string — and at the bar the night number is what you scan for.
+    """
+    session = _get_session(request)
+    access_token = session.get("access_token")
+    if not access_token:
+        raise HTTPException(401, "Not authenticated")
+    library = _track_cache.get(access_token, [])
+    if not library:
+        raise HTTPException(400, "Load tracks first via /api/tracks")
+
+    body    = await request.json()
+    dry_run = bool(body.get("dry_run", True))
+    try:
+        nights          = max(1, min(30, int(body.get("nights", 10))))
+        bpm_cap         = max(80, min(200, int(body.get("bpm_cap", 128))))
+        core_minutes    = max(30, min(300, int(body.get("core_minutes", 120))))
+        reserve_minutes = max(0, min(300, int(body.get("reserve_minutes", 90))))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "nights/bpm_cap/core_minutes/reserve_minutes must be numbers")
+
+    plan = plan_nights(
+        library, load_cache(), nights=nights, bpm_cap=bpm_cap,
+        core_minutes=core_minutes, reserve_minutes=reserve_minutes,
+    )
+    if not plan["nights"]:
+        raise HTTPException(400, "No hay temas analizados suficientes para armar una noche.")
+
+    summary = [
+        {
+            "night":            n["night"],
+            "vibe":             n["vibe"],
+            "label":            n["label"],
+            "count":            n["count"],
+            "core_count":       n["core_count"],
+            "duration_ms":      n["duration_ms"],
+            "core_duration_ms": n["core_duration_ms"],
+            "bpm_lo":           n["bpm_lo"],
+            "bpm_hi":           n["bpm_hi"],
+            "short":            n["short"],
+            "warnings":         n["warnings"],
+            "sample":           [f'{t["title"]} — {t["artists"]}'
+                                 for t in n["result"]["tracks"][:3]],
+        }
+        for n in plan["nights"]
+    ]
+    if dry_run:
+        return JSONResponse({"dry_run": True, "nights": summary,
+                             "stats": plan["stats"], "skipped": plan["skipped"]})
+
+    created = []
+    for n in plan["nights"]:
+        params = {
+            "nights":          True,
+            "night":           n["night"],
+            "vibe":            n["vibe"],
+            "duration_min":    round(n["duration_ms"] / 60000),
+            "core_minutes":    round(n["core_duration_ms"] / 60000),
+            "core_count":      n["core_count"],
+            "bpm_cap":         bpm_cap,
+            "genre_filter":    None,
+            "bpm_range":       None,
+        }
+        pl = create_playlist(n["result"], params,
+                             name=f'Noche {n["night"]} · {n["label"]}')
+        created.append({"id": pl["id"], "name": pl["name"]})
+    log.info("Nights planned: %d sets, %d tracks placed (cap %d BPM)",
+             len(created), plan["stats"]["placed"], bpm_cap)
     return JSONResponse({"dry_run": False, "created": created, "stats": plan["stats"]})
 
 

@@ -11,6 +11,7 @@ Coverage:
   - Track role classification
   - Scoring function
   - Core generator (narrative, sections, BPM arc, no duplicates)
+  - Progressive arc + nights planner (vibes, BPM cap, core/reserve)
   - Persistence
 """
 import json
@@ -21,7 +22,9 @@ from unittest.mock import patch
 import pytest
 
 from playlist_engine import (
+    NIGHT_VIBES,
     PLAYLISTS_FILE,
+    PROGRESSIVE_SECTIONS,
     UNIVERSAL_SECTIONS,
     SectionDef,
     SectionSlot,
@@ -39,7 +42,9 @@ from playlist_engine import (
     genre_options,
     load_playlists,
     plan_library_tour,
+    plan_nights,
     save_playlists,
+    vibe_membership,
     score_candidate,
     tags_to_clusters,
     tempo_distance_pct,
@@ -622,6 +627,297 @@ class TestLibraryTour:
     def test_empty_library(self):
         plan = plan_library_tour([], {})
         assert plan["sets"] == []
+
+
+class TestProgressiveSections:
+    """The dinner arc's defining properties, as opposed to the club arc."""
+
+    def test_weights_sum_to_one(self):
+        assert abs(sum(s.weight for s in PROGRESSIVE_SECTIONS) - 1.0) < 1e-9
+
+    def test_energy_never_dives(self):
+        """No valley: over dinner an energy dip reads as 'the music died'."""
+        lows  = [s.energy_min for s in PROGRESSIVE_SECTIONS]
+        highs = [s.energy_max for s in PROGRESSIVE_SECTIONS]
+        # The tail (reserve) is allowed to hold instead of climb, so compare
+        # only up to the peak section.
+        peak = max(range(len(highs)), key=lambda i: highs[i])
+        assert lows[:peak + 1]  == sorted(lows[:peak + 1])
+        assert highs[:peak + 1] == sorted(highs[:peak + 1])
+
+    def test_universal_arc_does_dive(self):
+        """Guards the contrast: the club arc's valley is deliberate."""
+        mids = [(s.energy_min + s.energy_max) / 2 for s in UNIVERSAL_SECTIONS]
+        assert any(b < a for a, b in zip(mids, mids[1:]))
+
+    def test_tempo_climbs_monotonically(self):
+        factors = [s.bpm_factor for s in PROGRESSIVE_SECTIONS]
+        assert factors == sorted(factors)
+
+    def test_no_popularity_gates(self):
+        """A locally-analysed library leaves popularity at 0 for most tracks,
+        so any pop_min would silently exclude them from those slots."""
+        for s in PROGRESSIVE_SECTIONS:
+            assert s.pop_min == 0 and s.pop_max == 100
+
+    def test_energy_windows_are_wide(self):
+        for s in PROGRESSIVE_SECTIONS:
+            assert s.energy_max - s.energy_min >= 20, s.name
+
+
+class TestHitSlotRefactor:
+    """hit_first/hit_last replaced section-name checks — same slots as before."""
+
+    def test_universal_hit_slots_unchanged(self):
+        slots = distribute_sections(28, 124)
+        by_section = {}
+        for i, sl in enumerate(slots):
+            by_section.setdefault(sl.section_name, []).append((i, sl.is_hit_slot))
+
+        peak = by_section["peak_a"]
+        assert [h for _, h in peak] == [False] * (len(peak) - 1) + [True]
+
+        climax = by_section["climax"]
+        expected = [j <= 1 for j in range(len(climax))]
+        assert [h for _, h in climax] == expected
+
+        for name, slots_of in by_section.items():
+            if name not in ("peak_a", "climax"):
+                assert not any(h for _, h in slots_of), name
+
+    def test_progressive_arc_has_no_hit_slots(self):
+        slots = distribute_sections(30, 120, None, PROGRESSIVE_SECTIONS)
+        assert not any(sl.is_hit_slot for sl in slots)
+
+    def test_progressive_profile_is_used(self):
+        slots = distribute_sections(30, 120, None, PROGRESSIVE_SECTIONS)
+        assert {sl.section_name for sl in slots} == {
+            s.name for s in PROGRESSIVE_SECTIONS
+        }
+
+
+class TestVibeMembership:
+    def test_fine_tags_separate_electronic_vibes(self):
+        """The whole point: GENRE_CLUSTERS calls all of these 'electronic'."""
+        assert vibe_membership(["Deep House"])   == {"deep_house"}
+        assert vibe_membership(["Dub Techno"])   == {"dub_techno"}
+        assert vibe_membership(["Nu-Disco"])     == {"nu_disco"}
+        assert vibe_membership(["Trip Hop"])     == {"trip_jazz"}
+
+    def test_separator_variants_match(self):
+        assert vibe_membership(["nu disco"]) == vibe_membership(["Nu-Disco"])
+
+    def test_membership_overlaps(self):
+        assert vibe_membership(["Deep House", "Tech House"]) == {
+            "deep_house", "tech_minimal"
+        }
+
+    def test_unknown_tags_match_nothing(self):
+        assert vibe_membership(["Gregorian Chant"]) == set()
+        assert vibe_membership([]) == set()
+
+    def test_every_vibe_is_reachable(self):
+        """No vibe key is unreachable through its own member tags."""
+        for key, _, members in NIGHT_VIBES:
+            assert key in vibe_membership([next(iter(members))]), key
+
+
+class TestNights:
+    # Each vibe gets its own BPM band with room for the arc to climb.
+    VIBES = [
+        (["Downtempo"],         88),
+        (["Trip Hop"],          92),
+        (["Cumbia"],            96),
+        (["Tropical House"],   100),
+        (["Nu-Disco"],         104),
+        (["Synth-pop"],        106),
+        (["Deep House"],       108),
+        (["Progressive House"],112),
+        (["Tech House"],       114),
+        (["Dub Techno"],       116),
+    ]
+
+    def _library(self, per_vibe=22, vibes=None, prefix="t"):
+        lib, i = [], 0
+        for tags, lo in (vibes or self.VIBES):
+            for j in range(per_vibe):
+                lib.append(_track(
+                    tid=f"{prefix}{i}", title=f"T{prefix}{i}", artists=f"A{i % 13}",
+                    bpm=lo + round(j * 12 / max(per_vibe - 1, 1)),
+                    camelot=["8A", "9A", "8B", "5A", "12A", "7A"][j % 6],
+                    energy=48 + (j * 37) % 45,
+                    duration_ms=240_000,
+                    genres=list(tags),
+                ))
+                i += 1
+        return lib
+
+    def _cache(self, lib):
+        return {
+            t["id"]: {"bpm": t["bpm"], "camelot": t["camelot"],
+                      "energy": t["energy"], "track_genres": t["genres"],
+                      "vocalness": (k * 29) % 100}
+            for k, t in enumerate(lib)
+        }
+
+    def _plan(self, lib=None, **kw):
+        lib = lib if lib is not None else self._library()
+        kw.setdefault("core_minutes", 30)
+        kw.setdefault("reserve_minutes", 20)
+        return plan_nights(lib, self._cache(lib), **kw)
+
+    def test_builds_the_requested_number_of_nights(self):
+        plan = self._plan(nights=10)
+        assert plan["stats"]["nights"] == 10
+        assert [n["night"] for n in plan["nights"]] == list(range(1, 11))
+
+    def test_fewer_nights_than_vibes(self):
+        plan = self._plan(nights=4)
+        assert plan["stats"]["nights"] == 4
+        # The vibes left out are reported, not silently dropped.
+        assert any(s["reason"].startswith("más vibes") for s in plan["skipped"])
+
+    def test_nights_are_disjoint(self):
+        plan = self._plan()
+        seen = set()
+        for n in plan["nights"]:
+            ids = {t["id"] for t in n["result"]["tracks"]}
+            assert not (ids & seen), f"tema repetido en noche {n['night']}"
+            seen |= ids
+
+    def test_each_night_has_one_vibe(self):
+        plan = self._plan()
+        for n in plan["nights"]:
+            for t in n["result"]["tracks"]:
+                assert n["vibe"] in vibe_membership(t["tags"]), \
+                    f"{t['title']} no pertenece a {n['vibe']}"
+
+    def test_bpm_cap_is_respected(self):
+        plan = self._plan(bpm_cap=120)
+        for n in plan["nights"]:
+            assert n["bpm_hi"] <= 120
+            for t in n["result"]["tracks"]:
+                assert t["bpm"] <= 120
+
+    def test_no_big_tempo_jumps(self):
+        """The reason this mode exists: adjacent tracks stay mixable."""
+        plan = self._plan()
+        for n in plan["nights"]:
+            tracks = n["result"]["tracks"]
+            for a, b in zip(tracks, tracks[1:]):
+                if b.get("transition") == "reset":
+                    continue
+                assert tempo_distance_pct(a["bpm"], b["bpm"]) <= 0.081, \
+                    f"noche {n['night']}: {a['bpm']}→{b['bpm']}"
+
+    def test_tempo_climbs_across_the_night(self):
+        plan = self._plan()
+        for n in plan["nights"]:
+            tracks = n["result"]["tracks"]
+            head = tracks[:max(3, len(tracks) // 5)]
+            tail = tracks[-max(3, len(tracks) // 5):]
+            mean = lambda ts: sum(t["bpm"] for t in ts) / len(ts)
+            assert mean(tail) > mean(head), f"noche {n['night']} no sube"
+
+    def test_core_reserve_split(self):
+        plan = self._plan(core_minutes=30, reserve_minutes=20)
+        for n in plan["nights"]:
+            tracks = n["result"]["tracks"]
+            assert 1 <= n["core_count"] <= n["count"] == len(tracks)
+            assert [t["phase"] for t in tracks[:n["core_count"]]] == \
+                   ["core"] * n["core_count"]
+            assert all(t["phase"] == "reserva"
+                       for t in tracks[n["core_count"]:])
+
+    def test_core_lands_near_the_requested_length(self):
+        plan = self._plan(core_minutes=30, reserve_minutes=20)
+        for n in plan["nights"]:
+            if n["short"]:
+                continue
+            minutes = n["core_duration_ms"] / 60_000
+            # The cut falls on a track boundary, so half a track either way.
+            assert 26 <= minutes <= 34, f"noche {n['night']}: {minutes:.0f}min"
+
+    def test_reserve_exists_beyond_the_core(self):
+        plan = self._plan(core_minutes=30, reserve_minutes=20)
+        for n in plan["nights"]:
+            if n["short"]:
+                continue
+            assert n["duration_ms"] > n["core_duration_ms"], \
+                f"noche {n['night']} no tiene reserva"
+
+    def test_thin_vibe_is_skipped_not_padded(self):
+        """Nine coherent nights beat ten with one incoherent."""
+        vibes = list(self.VIBES)
+        lib   = self._library(vibes=vibes[1:])          # nine full vibes
+        lib  += self._library(per_vibe=2, vibes=vibes[:1], prefix="thin")
+        plan  = plan_nights(lib, self._cache(lib), nights=10,
+                            core_minutes=30, reserve_minutes=20)
+        assert "apertura" not in {n["vibe"] for n in plan["nights"]}
+        thin = [s for s in plan["skipped"] if s["vibe"] == "apertura"]
+        assert thin and "insuficiente" in thin[0]["reason"]
+        # And the tracks it could not use are not smuggled into another night.
+        for n in plan["nights"]:
+            for t in n["result"]["tracks"]:
+                assert "apertura" not in vibe_membership(t["tags"])
+
+    def test_scarce_vibe_wins_the_shared_tracks(self):
+        """Allocation order: a 42-track family must not starve a 14-track one
+        that shares most of its pool and cannot replace what it loses."""
+        lib = []
+        for i in range(30):
+            lib.append(_track(tid=f"d{i}", title=f"D{i}", artists=f"A{i % 7}",
+                              bpm=108 + i % 13, camelot="8A", energy=50 + i % 40,
+                              duration_ms=240_000, genres=["Deep House"]))
+        for i in range(12):
+            lib.append(_track(tid=f"s{i}", title=f"S{i}", artists=f"B{i % 5}",
+                              bpm=116 + i % 11, camelot="9A", energy=60 + i % 30,
+                              duration_ms=240_000,
+                              genres=["Deep House", "Tech House"]))
+        for i in range(2):
+            lib.append(_track(tid=f"x{i}", title=f"X{i}", artists="C",
+                              bpm=120 + i, camelot="5A", energy=70,
+                              duration_ms=240_000, genres=["Tech House"]))
+        plan = plan_nights(lib, self._cache(lib), nights=2,
+                           core_minutes=30, reserve_minutes=10)
+        assert {n["vibe"] for n in plan["nights"]} == {"deep_house", "tech_minimal"}
+
+    def test_continuous_mixes_are_excluded(self):
+        lib = self._library()
+        lib.append(_track(tid="mix", title="Continuous Mix", artists="Z",
+                          bpm=120, camelot="8A", energy=70,
+                          duration_ms=63 * 60_000, genres=["Deep House"]))
+        plan = plan_nights(lib, self._cache(lib), nights=10,
+                           core_minutes=30, reserve_minutes=20)
+        assert plan["stats"]["too_long"] == 1
+        for n in plan["nights"]:
+            assert all(t["id"] != "mix" for t in n["result"]["tracks"])
+
+    def test_max_track_minutes_is_configurable(self):
+        lib = self._library()
+        lib.append(_track(tid="long", title="Long", artists="Z",
+                          bpm=118, camelot="8A", energy=70,
+                          duration_ms=25 * 60_000, genres=["Deep House"]))
+        kept = plan_nights(lib, self._cache(lib), nights=10, core_minutes=30,
+                           reserve_minutes=20, max_track_minutes=30)
+        assert kept["stats"]["too_long"] == 0
+
+    def test_empty_library(self):
+        plan = plan_nights([], {})
+        assert plan["nights"] == [] and plan["stats"]["pool"] == 0
+
+    def test_unanalysed_library_yields_no_nights(self):
+        lib = self._library()
+        plan = plan_nights(lib, {}, nights=10)
+        assert plan["nights"] == []
+
+    def test_stats_add_up(self):
+        plan = self._plan()
+        placed = sum(n["count"] for n in plan["nights"])
+        assert plan["stats"]["placed"] == placed
+        assert plan["stats"]["placed"] <= plan["stats"]["pool"]
+        assert plan["stats"]["total_ms"] == sum(
+            n["duration_ms"] for n in plan["nights"])
 
 
 class TestVerifyFindings:
