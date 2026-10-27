@@ -10,7 +10,7 @@ from typing import Optional
 import httpx
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from analysis import load_cache, save_cache, analyze_track as _yt_analyze
@@ -19,7 +19,7 @@ from getsongbpm import lookup_track, QUOTA_EXCEEDED as _GETSONGBPM_QUOTA
 from lastfm import lookup_track_tags as _lastfm_tags
 from playlist_engine import (
     create_playlist, delete_playlist, generate as generate_playlist,
-    genre_options, load_playlists, plan_library_tour, save_playlists,
+    genre_options, load_playlists, plan_library_tour, plan_nights, save_playlists,
 )
 from set_namer import generate_set_name
 from spotify import build_track_library
@@ -81,8 +81,33 @@ _analysis_state: dict = {
     "last_done": None,    # {title, bpm, finished: epoch}
 }
 
+class RevalidatingStaticFiles(StaticFiles):
+    """StaticFiles that makes the browser revalidate before reusing a file.
+
+    Starlette sends last-modified and etag but no Cache-Control, so browsers
+    fall back to HEURISTIC freshness: for a file last modified months ago they
+    will happily serve their copy for days without asking us at all.
+
+    That is not academic — it cost a working session. Two branches of this app
+    ran on the same http://127.0.0.1:8000 (one in the main checkout, one in a
+    worktree), and `index.html` is re-read per request while `/static/app.js`
+    was not: the browser paired the NEW html with the OLD js, so the page grew
+    a button whose click handler did not exist and the console threw a bare
+    ReferenceError. Not one /static/ request reached the server to show it.
+
+    "no-cache" does not mean "do not store" — it means revalidate first. The
+    ETag still answers 304 and an unchanged file is never re-downloaded, so
+    this costs one conditional request per file per load and buys correctness.
+    """
+
+    def file_response(self, *args, **kwargs) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 static_dir = Path(__file__).parent / "static"
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
+app.mount("/static", RevalidatingStaticFiles(directory=static_dir), name="static")
 
 # Error prefixes that are permanent (not transient) — safe to cache so we don't
 # waste API calls retrying them. Defined at module level so _lookup() can use it.
@@ -664,6 +689,85 @@ async def api_library_tour(request: Request, background_tasks: BackgroundTasks):
         )
     log.info("Library tour created: %d sets, %d tracks placed",
              len(created), plan["stats"]["placed"])
+    return JSONResponse({"dry_run": False, "created": created, "stats": plan["stats"]})
+
+
+@app.post("/api/playlists/nights")
+async def api_plan_nights(request: Request):
+    """Plan a residency: one progressive set per night, each with its own vibe.
+
+    Body: {"dry_run": true} returns the proposed plan without creating
+    anything; {"dry_run": false} creates one playlist per night.
+
+    Unlike the library tour, these sets are NOT auto-renamed by the AI. The
+    creative name is prepended, which would push "Noche 4" off the front of
+    the string — and at the bar the night number is what you scan for.
+    """
+    session = _get_session(request)
+    access_token = session.get("access_token")
+    if not access_token:
+        raise HTTPException(401, "Not authenticated")
+    library = _track_cache.get(access_token, [])
+    if not library:
+        raise HTTPException(400, "Load tracks first via /api/tracks")
+
+    body    = await request.json()
+    dry_run = bool(body.get("dry_run", True))
+    try:
+        nights          = max(1, min(30, int(body.get("nights", 10))))
+        bpm_cap         = max(80, min(200, int(body.get("bpm_cap", 128))))
+        core_minutes    = max(30, min(300, int(body.get("core_minutes", 120))))
+        reserve_minutes = max(0, min(300, int(body.get("reserve_minutes", 90))))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "nights/bpm_cap/core_minutes/reserve_minutes must be numbers")
+
+    plan = plan_nights(
+        library, load_cache(), nights=nights, bpm_cap=bpm_cap,
+        core_minutes=core_minutes, reserve_minutes=reserve_minutes,
+    )
+    if not plan["nights"]:
+        raise HTTPException(400, "No hay temas analizados suficientes para armar una noche.")
+
+    summary = [
+        {
+            "night":            n["night"],
+            "vibe":             n["vibe"],
+            "label":            n["label"],
+            "count":            n["count"],
+            "core_count":       n["core_count"],
+            "duration_ms":      n["duration_ms"],
+            "core_duration_ms": n["core_duration_ms"],
+            "bpm_lo":           n["bpm_lo"],
+            "bpm_hi":           n["bpm_hi"],
+            "short":            n["short"],
+            "warnings":         n["warnings"],
+            "sample":           [f'{t["title"]} — {t["artists"]}'
+                                 for t in n["result"]["tracks"][:3]],
+        }
+        for n in plan["nights"]
+    ]
+    if dry_run:
+        return JSONResponse({"dry_run": True, "nights": summary,
+                             "stats": plan["stats"], "skipped": plan["skipped"]})
+
+    created = []
+    for n in plan["nights"]:
+        params = {
+            "nights":          True,
+            "night":           n["night"],
+            "vibe":            n["vibe"],
+            "duration_min":    round(n["duration_ms"] / 60000),
+            "core_minutes":    round(n["core_duration_ms"] / 60000),
+            "core_count":      n["core_count"],
+            "bpm_cap":         bpm_cap,
+            "genre_filter":    None,
+            "bpm_range":       None,
+        }
+        pl = create_playlist(n["result"], params,
+                             name=f'Noche {n["night"]} · {n["label"]}')
+        created.append({"id": pl["id"], "name": pl["name"]})
+    log.info("Nights planned: %d sets, %d tracks placed (cap %d BPM)",
+             len(created), plan["stats"]["placed"], bpm_cap)
     return JSONResponse({"dry_run": False, "created": created, "stats": plan["stats"]})
 
 

@@ -494,6 +494,95 @@ async function createTour(btn) {
   }
 }
 
+// ── Noches: one progressive set per night, each with its own vibe ──────────
+
+async function proposeNights() {
+  const btn = document.getElementById("pl-nights-btn");
+  const box = document.getElementById("pl-nights-proposal");
+  btn.disabled = true;
+  box.style.display = "";
+  box.innerHTML = '<p class="muted">Armando las noches…</p>';
+  try {
+    const res = await fetch("/api/playlists/nights", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        dry_run: true,
+        nights: Number(document.getElementById("pl-nights-count").value) || 10,
+        bpm_cap: Number(document.getElementById("pl-nights-cap").value) || 128,
+        core_minutes: Number(document.getElementById("pl-nights-core").value) || 120,
+        reserve_minutes: Number(document.getElementById("pl-nights-reserve").value) || 90,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) { box.innerHTML = `<p class="muted">Error: ${data.detail}</p>`; return; }
+
+    const hours = (data.stats.total_ms / 3600000).toFixed(1);
+    const rows = data.nights.map(n => {
+      const core = Math.round(n.core_duration_ms / 60000);
+      const tot  = Math.round(n.duration_ms / 60000);
+      const flag = n.short ? " ⚠" : "";
+      const warn = n.warnings.length
+        ? `<br><small class="muted">${n.warnings.join(" ")}</small>` : "";
+      return `<tr><td>${n.night}</td><td>${n.label}${flag}${warn}</td>` +
+             `<td>${core}min <span class="muted">+${tot - core}</span></td>` +
+             `<td>${n.core_count} <span class="muted">+${n.count - n.core_count}</span></td>` +
+             `<td>${n.bpm_lo}–${n.bpm_hi}</td>` +
+             `<td class="muted">${n.sample[0] || ""}</td></tr>`;
+    }).join("");
+    const skipped = data.skipped.length
+      ? `<p class="muted">Sin noche: ` +
+        data.skipped.map(s => `${s.label} (${s.reason})`).join(" · ") + `</p>`
+      : "";
+    const longs = data.stats.too_long
+      ? `<p class="muted">${data.stats.too_long} tema(s) excluido(s) por durar
+         demasiado (mixes continuos).</p>`
+      : "";
+    box.innerHTML = `
+      <h3>${data.nights.length} noches · ${data.stats.placed}/${data.stats.pool} temas · ${hours}h · hasta ${data.stats.bpm_cap} BPM</h3>
+      <div class="table-wrap" style="max-height:340px;overflow-y:auto">
+        <table><thead><tr><th>#</th><th>Vibe</th><th>Set + reserva</th>
+        <th>Temas</th><th>BPM</th><th>Abre con</th></tr></thead>
+        <tbody>${rows}</tbody></table>
+      </div>
+      ${skipped}
+      ${longs}
+      <button class="btn-primary" onclick="createNights(this)">Crear estas ${data.nights.length} noches</button>
+      <button class="btn-ghost" onclick="document.getElementById('pl-nights-proposal').style.display='none'">Cancelar</button>
+    `;
+  } catch (e) {
+    box.innerHTML = `<p class="muted">Error: ${e.message}</p>`;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function createNights(btn) {
+  btn.disabled = true;
+  btn.textContent = "Creando noches…";
+  try {
+    const res = await fetch("/api/playlists/nights", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({
+        dry_run: false,
+        nights: Number(document.getElementById("pl-nights-count").value) || 10,
+        bpm_cap: Number(document.getElementById("pl-nights-cap").value) || 128,
+        core_minutes: Number(document.getElementById("pl-nights-core").value) || 120,
+        reserve_minutes: Number(document.getElementById("pl-nights-reserve").value) || 90,
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) { btn.textContent = `Error: ${data.detail}`; return; }
+    document.getElementById("pl-nights-proposal").innerHTML =
+      `<p>✓ ${data.created.length} noches creadas (${data.stats.placed} temas).</p>`;
+    await loadPlaylists();
+  } catch (e) {
+    btn.textContent = `Error: ${e.message}`;
+    btn.disabled = false;
+  }
+}
+
 async function exportAllPlaylists() {
   const btn = document.getElementById("pl-export-all-btn");
   const status = document.getElementById("pl-export-all-status");

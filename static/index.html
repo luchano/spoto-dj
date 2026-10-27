@@ -132,11 +132,38 @@
             </label>
           </div>
 
+          <!-- Noches: residency planner. Its own row because these four
+               settings belong to that mode only, not to the single-set form
+               above (a BPM CAP is not the BPM range: the sets climb up to it). -->
+          <div class="pl-form-row">
+            <label>
+              Noches
+              <input type="number" id="pl-nights-count" min="1" max="30" value="10" />
+            </label>
+            <label>
+              Techo de BPM
+              <input type="number" id="pl-nights-cap" min="80" max="200" value="128" />
+              <span class="bpm-hint muted">Cada noche sube hasta acá, nunca más.</span>
+            </label>
+            <label>
+              Set
+              <input type="number" id="pl-nights-core" min="30" max="300" step="10" value="120" />
+              <span class="bpm-hint muted">Minutos que vas a tocar.</span>
+            </label>
+            <label>
+              Reserva
+              <input type="number" id="pl-nights-reserve" min="0" max="300" step="10" value="90" />
+              <span class="bpm-hint muted">Minutos de más, por si se estira.</span>
+            </label>
+          </div>
+
           <button class="btn-primary" id="pl-generate-btn" onclick="generatePlaylist()">Generate Set</button>
           <button class="btn-ghost" id="pl-tour-btn" onclick="proposeTour()">🧭 Tour de biblioteca</button>
+          <button class="btn-ghost" id="pl-nights-btn" onclick="proposeNights()">🌙 Noches</button>
           <span id="pl-gen-status" class="muted" style="margin-left:12px"></span>
         </div>
         <div id="pl-tour-proposal" style="display:none"></div>
+        <div id="pl-nights-proposal" style="display:none"></div>
       </div>
 
       <!-- Saved playlists list -->
@@ -179,6 +206,6 @@
     <p class="muted">BPM &amp; key data powered by <a href="https://getsongbpm.com" target="_blank" rel="noopener">GetSongBPM</a></p>
   </footer>
 
-  <script src="/static/app.js?v=13"></script>
+  <script src="/static/app.js?v=14"></script>
 </body>
 </html>

@@ -131,6 +131,8 @@ class SectionDef:
     bpm_factor: float   # multiplier on the pool's base BPM
     pop_min: int        # popularity floor  (0 = unconstrained)
     pop_max: int        # popularity ceiling (100 = unconstrained)
+    hit_first: int = 0  # this section's first N slots are "hit" slots
+    hit_last: int  = 0  # this section's last N slots are "hit" slots
 
 
 @dataclass
@@ -159,11 +161,43 @@ UNIVERSAL_SECTIONS: List[SectionDef] = [
     #              name           label          emoji  wt    emin emax bfactor pmin pmax
     SectionDef("intro",       "Intro",       "🎵", 0.12, 25,  50, 0.94,  0,  70),
     SectionDef("build",       "Build",       "📈", 0.18, 45,  70, 0.97,  0,  85),
-    SectionDef("peak_a",      "First Peak",  "🔥", 0.12, 70,  90, 1.00, 55, 100),
+    SectionDef("peak_a",      "First Peak",  "🔥", 0.12, 70,  90, 1.00, 55, 100, hit_last=1),
     SectionDef("mid_journey", "Journey",     "🌊", 0.18, 50,  68, 0.98,  0,  75),
     SectionDef("escalation",  "Rise",        "⬆",  0.18, 65,  88, 1.02,  0,  90),
-    SectionDef("climax",      "Climax",      "💥", 0.12, 82, 100, 1.05, 60, 100),
+    SectionDef("climax",      "Climax",      "💥", 0.12, 82, 100, 1.05, 60, 100, hit_first=2),
     SectionDef("outro",       "Outro",       "🌅", 0.10, 35,  62, 0.97,  0,  70),
+]
+
+
+# Progressive arc — for a long dinner set rather than a club night.
+#
+# Three things make this different from UNIVERSAL_SECTIONS:
+#
+#  1. NO VALLEY. The universal arc drops energy mid-set so the climax hits
+#     harder, which works when people came to watch the DJ. Over dinner the
+#     same dip reads as "the music died" — the room goes quiet and the floor
+#     never recovers. Energy here only ever climbs.
+#  2. NO POPULARITY GATES. Every window is 0-100, for two reasons: a dinner
+#     set is not built out of hits, and in a locally-analyzed library most
+#     tracks carry popularity 0 (Spotify's audio-features endpoint 403s, so
+#     the field is often never filled), which a pop_min would silently
+#     exclude.
+#  3. WIDE, OVERLAPPING ENERGY WINDOWS (≥20 points, neighbours overlap).
+#     A real library's energy is not spread evenly across 0-100 — this one
+#     piles up between 70 and 89 — so narrow windows would leave early slots
+#     with nothing to pick and force the relaxation ladder on every slot.
+#
+# The tail section is the overflow hour: it holds near the top instead of
+# winding down, so a night that stretches past its planned end keeps the room
+# where the climb left it. It is also what the core/reserve split cuts into.
+PROGRESSIVE_SECTIONS: List[SectionDef] = [
+    #              name          label         emoji  wt    emin emax bfactor pmin pmax
+    SectionDef("apertura",   "Apertura",   "🍷", 0.16, 30,  66, 0.86, 0, 100),
+    SectionDef("mesa",       "Mesa",       "🍽", 0.20, 50,  74, 0.91, 0, 100),
+    SectionDef("sobremesa",  "Sobremesa",  "☕", 0.18, 60,  80, 0.95, 0, 100),
+    SectionDef("calor",      "Calor",      "🔥", 0.18, 70,  90, 0.99, 0, 100),
+    SectionDef("pico",       "Pico",       "💥", 0.16, 76,  96, 1.02, 0, 100),
+    SectionDef("reserva",    "Reserva",    "🌙", 0.12, 72,  94, 1.04, 0, 100),
 ]
 
 
@@ -182,14 +216,15 @@ def distribute_sections(
     n_tracks: int,
     base_bpm: int,
     bpm_range: Optional[Tuple[int, int]] = None,
+    sections: Optional[List[SectionDef]] = None,
 ) -> List[SectionSlot]:
-    """Assign *n_tracks* to the universal 7-section narrative arc.
+    """Assign *n_tracks* to a section profile (the universal 7-act arc by default).
 
     BPM targets are scaled from *base_bpm* using each section's factor,
     then clamped to *bpm_range* when provided so every slot stays within
     the requested BPM envelope.
     """
-    defs      = UNIVERSAL_SECTIONS
+    defs      = sections or UNIVERSAL_SECTIONS
     bpm_lo    = bpm_range[0] if bpm_range else 0
     bpm_hi    = bpm_range[1] if bpm_range else 9999
 
@@ -238,10 +273,7 @@ def distribute_sections(
             continue
 
         for j in range(count):
-            is_hit = (
-                (sec_def.name == "peak_a" and j == count - 1) or
-                (sec_def.name == "climax" and j <= 1)
-            )
+            is_hit = j < sec_def.hit_first or j >= count - sec_def.hit_last
             bpm_t, target_e = _interp(float(pos))
             slots.append(SectionSlot(
                 section_name  = sec_def.name,
@@ -511,6 +543,11 @@ def build_pool(library: list, cache: dict) -> list:
             "year":           int(t["year"]) if str(t.get("year", "")).strip().isdigit() else 0,
             "vocalness":      analysis.get("vocalness"),
             "genres":         t.get("genres", []),
+            # Fine-grained tags ("Deep House", "Dub Techno"), kept because the
+            # GENRE_CLUSTERS above are far too coarse to tell two electronic
+            # vibes apart — everything from ambient to techno lands in
+            # "electronic". NIGHT_VIBES reads these.
+            "tags":           tags,
             "genre_cluster":  classify_genre(tags),      # primary, for display
             "genre_clusters": cluster_membership(analysis, tags),  # affinity-aware
             "spotify_url":    t.get("spotify_url", ""),
@@ -781,11 +818,14 @@ def _sequence_pool(
     bpm_range: Optional[Tuple[int, int]] = None,
     warnings: Optional[List[str]] = None,
     max_resets: int = MAX_RESETS_PER_SET,
+    sections: Optional[List[SectionDef]] = None,
 ) -> dict:
     """Sequence a prepared pool into a narrative-arc set (beam search core).
 
-    Shared by generate() (which filters the pool by genre/BPM first) and the
-    library-tour planner (which passes pre-partitioned cohesive chunks)."""
+    Shared by generate() (which filters the pool by genre/BPM first), the
+    library-tour planner (which passes pre-partitioned cohesive chunks) and
+    the nights planner (which passes PROGRESSIVE_SECTIONS instead of the
+    default 7-act arc)."""
     warnings = warnings if warnings is not None else []
 
     # ── Set-wide parameters ──────────────────────────────────────────────────
@@ -797,7 +837,7 @@ def _sequence_pool(
         )
 
     base_bpm = compute_base_bpm(pool, bpm_range)
-    slots    = distribute_sections(n_tracks, base_bpm, bpm_range)
+    slots    = distribute_sections(n_tracks, base_bpm, bpm_range, sections)
 
     # ── Beam-search selection over the slot trajectory ───────────────────────
     # Greedy pickers dead-end (they burn scarce "bridge" tracks and leave slots
@@ -1105,6 +1145,272 @@ def plan_library_tour(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Noches — one progressive set per night, each with its own vibe
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Vibe families, ordered calm → intense (that order becomes the night
+# numbering, so the ten-night cycle itself builds).
+#
+# These are deliberately FINER than GENRE_CLUSTERS. That taxonomy exists to
+# answer "is this electronic music?", and lumps ambient, nu-disco, deep house
+# and techno into one bucket — useless when the whole point is that ten
+# nights sound different from each other. Membership is overlapping on
+# purpose: a track tagged both "Deep House" and "Tech House" is a legitimate
+# candidate for either night, and plan_nights() decides which one gets it.
+#
+# Members are in NORMALISED form (see _normalize_tag): lowercased, with
+# everything but a-z/0-9/& stripped, so "Nu-Disco" / "nu disco" both match.
+NIGHT_VIBES = [
+    ("apertura", "Apertura orgánica", {
+        "downtempo", "ambient", "chillwave", "chillout", "chill", "lounge",
+        "experimental", "balearic", "downbeat",
+    }),
+    ("trip_jazz", "Trip hop & future jazz", {
+        "triphop", "futurejazz", "nujazz", "acidjazz", "brokenbeat",
+        "jazzdance", "neosoul", "jazzfunk",
+    }),
+    ("electro_latino", "Electro-latino", {
+        "latin", "cumbia", "electrocumbia", "digitalcumbia", "latinelectronic",
+        "reggaeton", "dembow", "dub", "tropical",
+    }),
+    ("tropical", "Organic & tropical house", {
+        "tropicalhouse", "tribalhouse", "organichouse", "afrohouse", "afro",
+        "worldfusion",
+    }),
+    ("nu_disco", "Nu-disco & funk", {
+        "nudisco", "disco", "italodisco", "funk", "soul", "synthwave",
+        "jazzdance",
+    }),
+    ("voces", "Voces & synth-pop", {
+        "synthpop", "dancepop", "electropop", "pop", "electroclash",
+    }),
+    ("deep_house", "Deep house", {
+        "deephouse", "chillhouse", "microhouse",
+    }),
+    ("progresivo", "Progressive & melodic", {
+        "progressivehouse", "melodichouse", "electrohouse", "electro",
+    }),
+    ("tech_minimal", "Tech house & minimal", {
+        "techhouse", "minimal", "minimaltechno", "bassline", "deeptech",
+    }),
+    ("dub_techno", "Dub techno hipnótico", {
+        "dubtechno", "deeptechno", "techno",
+    }),
+]
+
+NIGHT_VIBE_LABELS = {key: label for key, label, _ in NIGHT_VIBES}
+
+
+def vibe_membership(tags: list, vibes: Optional[list] = None) -> set:
+    """Every night-vibe key the given genre tags belong to (may be empty)."""
+    defs = vibes or NIGHT_VIBES
+    norm = {_normalize_tag(p) for g in tags if g for p in _expand_tag(g)}
+    norm.discard("")
+    return {key for key, _, members in defs if norm & members}
+
+
+def _overlapped_ms(tracks: list) -> int:
+    """Wall-clock duration of a sequenced run, net of the 15s crossfade per
+    transition — the same convention _sequence_pool uses for a whole set."""
+    if not tracks:
+        return 0
+    return max(0, sum(t["duration_ms"] for t in tracks) - (len(tracks) - 1) * 15_000)
+
+
+def _core_cut(tracks: list, core_ms: int) -> int:
+    """How many tracks make up the core set: the cut whose wall-clock duration
+    lands CLOSEST to core_ms. Everything after it is the reserve tail.
+
+    Closest, not "first one past it": these are DJ-length tracks, and always
+    crossing from below overshot by up to a whole track (19 minutes on a
+    minimal-techno night of 10-minute cuts). Being a few minutes short is the
+    better error anyway — the reserve is right there.
+    """
+    cum, best, best_err = 0, len(tracks), None
+    for i, t in enumerate(tracks):
+        cum += t["duration_ms"] - (15_000 if i else 0)
+        err = abs(cum - core_ms)
+        if best_err is None or err < best_err:
+            best_err, best = err, i + 1
+        if cum >= core_ms:
+            break
+    return best
+
+
+def plan_nights(
+    library: list,
+    cache: dict,
+    nights: int          = 10,
+    bpm_cap: int         = 128,
+    core_minutes: int    = 120,
+    reserve_minutes: int = 90,
+    max_track_minutes: int = 20,
+    vibes: Optional[list] = None,
+) -> dict:
+    """Plan *nights* progressive sets, one per vibe family, all disjoint.
+
+    Built for a dinner residency rather than a club night: every set climbs
+    steadily from its family's low end up to *bpm_cap* and never dives, and
+    each one runs long so a night that stretches does not run out of music.
+
+    Each night is one playlist of core_minutes + reserve_minutes, with the
+    core/reserve boundary marked per track ("phase"). It is deliberately NOT
+    two playlists: in a bar you want one thing that keeps playing when the
+    night goes long, and cutting at the planned end should leave you at the
+    top of the climb — which is why PROGRESSIVE_SECTIONS holds its tail high
+    instead of winding down.
+
+    Strategy
+    --------
+    1. Pool = analyzed tracks at or below *bpm_cap*.
+    2. Tracks longer than *max_track_minutes* are dropped: a library of liked
+       songs contains hour-long "Continuous Mix" entries, and one of them
+       lands as a single 63-minute block in the middle of a two-hour night.
+       The cutoff sits in the real gap in the duration distribution — tracks
+       run continuously up to ~14 minutes, then jump straight to 46+ — so it
+       keeps every extended version and drops only somebody else's DJ set.
+    3. Each vibe family claims the tracks whose tags match it (overlapping).
+    4. Families without enough material for the core set are skipped and
+       reported rather than padded from a neighbouring family — an incoherent
+       night is worse than nine nights.
+    5. Nights are allocated SCARCEST FAMILY FIRST. Nights are disjoint, so a
+       27-hour family would otherwise consume the shared tracks a 3-hour one
+       depends on and cannot replace.
+    6. Each family is sequenced by the beam search with no tempo-reset budget.
+
+    Returns {"nights": [...], "skipped": [...], "stats": {...}} where each
+    night has {night, vibe, label, result, count, core_count, duration_ms,
+    core_duration_ms, bpm_lo, bpm_hi, short, warnings}.
+    """
+    core_ms   = core_minutes * 60_000
+    target_ms = (core_minutes + reserve_minutes) * 60_000
+    max_ms    = max_track_minutes * 60_000
+    vibe_defs = vibes or NIGHT_VIBES
+
+    analysed  = [t for t in build_pool(library, cache) if 0 < t["bpm"] <= bpm_cap]
+    pool      = [t for t in analysed if t["duration_ms"] <= max_ms]
+    too_long  = len(analysed) - len(pool)
+    if not pool:
+        return {"nights": [], "skipped": [],
+                "stats": {"pool": 0, "placed": 0, "nights": 0, "total_ms": 0,
+                          "core_ms": 0, "bpm_cap": bpm_cap, "too_long": too_long}}
+
+    candidates: dict = {key: [] for key, _, _ in vibe_defs}
+    for t in pool:
+        for key in vibe_membership(t["tags"], vibe_defs):
+            candidates[key].append(t)
+    avail_ms = {k: sum(t["duration_ms"] for t in v) for k, v in candidates.items()}
+
+    skipped = [
+        {"vibe": k, "label": l, "reason": "material insuficiente para un set",
+         "available_ms": avail_ms[k], "count": len(candidates[k])}
+        for k, l, _ in vibe_defs if avail_ms[k] < core_ms
+    ]
+    viable = sorted((v for v in vibe_defs if avail_ms[v[0]] >= core_ms),
+                    key=lambda v: -avail_ms[v[0]])
+    chosen = viable[:nights]
+    skipped += [
+        {"vibe": k, "label": l, "reason": "más vibes disponibles que noches pedidas",
+         "available_ms": avail_ms[k], "count": len(candidates[k])}
+        for k, l, _ in viable[nights:]
+    ]
+
+    built: dict = {}
+    used: set = set()
+    for key, label, _ in sorted(chosen, key=lambda v: avail_ms[v[0]]):
+        avail = [t for t in candidates[key] if t["id"] not in used]
+        if _overlapped_ms(avail) < core_ms:
+            skipped.append({
+                "vibe": key, "label": label,
+                "reason": "sin temas libres suficientes después de las otras noches",
+                "available_ms": sum(t["duration_ms"] for t in avail),
+                "count": len(avail),
+            })
+            continue
+
+        # _sequence_pool maps duration→track count at a fixed 3.75 min/track.
+        # Real libraries differ (this one averages ~6 min, these being DJ-length
+        # tracks), so asking it for 210 minutes would hand back five hours.
+        # Convert through the family's OWN median instead, then ask in the
+        # engine's units, so the requested hours come out as hours.
+        med      = int(median(t["duration_ms"] for t in avail)) or 300_000
+        n_target = min(len(avail), max(5, -(-target_ms // med)))
+        dur_min  = max(5, round(n_target * 3.75))
+        bpm_lo   = max(60, int(min(t["bpm"] for t in avail)))
+
+        # A labeled tempo reset is precisely the "big jump" this mode exists to
+        # avoid, so the first attempt gets no reset budget at all. That can
+        # starve the beam search (every surviving beam dies and the set ends
+        # early), so if the night cannot even reach its core length we retry
+        # with one reset allowed — and say so instead of hiding it.
+        warnings: List[str] = []
+        result = _sequence_pool(list(avail), dur_min, (bpm_lo, bpm_cap),
+                                warnings=[], max_resets=0,
+                                sections=PROGRESSIVE_SECTIONS)
+        if result["total_duration_ms"] < core_ms:
+            relaxed = _sequence_pool(list(avail), dur_min, (bpm_lo, bpm_cap),
+                                     warnings=[], max_resets=1,
+                                     sections=PROGRESSIVE_SECTIONS)
+            if relaxed["total_duration_ms"] > result["total_duration_ms"]:
+                result = relaxed
+                warnings.append(
+                    "Para llegar a las dos horas el set incluye un salto de tempo marcado."
+                )
+
+        tracks = result["tracks"]
+        core_n = _core_cut(tracks, core_ms)
+        for i, t in enumerate(tracks):
+            t["phase"]       = "core" if i < core_n else "reserva"
+            t["phase_label"] = "Set" if i < core_n else "Reserva"
+        used.update(t["id"] for t in tracks)
+
+        bpms = [t["bpm"] for t in tracks] or [0]
+        # "Short" means the night cannot FILL its core set, not that the cut
+        # landed a couple of minutes off: _core_cut picks the nearest track
+        # boundary, so a 120-minute target legitimately lands on 118 or 121.
+        core_dur = _overlapped_ms(tracks[:core_n])
+        is_short = result["total_duration_ms"] < core_ms
+        if is_short:
+            warnings.append(
+                f"La noche junta {round(result['total_duration_ms'] / 60_000)} min "
+                f"en total, menos que el set de {core_minutes} min."
+            )
+        built[key] = {
+            "vibe":             key,
+            "label":            label,
+            "result":           result,
+            "count":            len(tracks),
+            "core_count":       core_n,
+            "duration_ms":      result["total_duration_ms"],
+            "core_duration_ms": core_dur,
+            "bpm_lo":           round(min(bpms)),
+            "bpm_hi":           round(max(bpms)),
+            "short":            is_short,
+            "warnings":         warnings + result.get("warnings", []),
+        }
+
+    nights_out = []
+    for key, _, _ in vibe_defs:
+        if key in built:
+            built[key]["night"] = len(nights_out) + 1
+            nights_out.append(built[key])
+
+    return {
+        "nights":  nights_out,
+        "skipped": skipped,
+        "stats": {
+            "pool":     len(pool),
+            "placed":   len(used),
+            "nights":   len(nights_out),
+            "total_ms": sum(n["duration_ms"] for n in nights_out),
+            "core_ms":  sum(n["core_duration_ms"] for n in nights_out),
+            "bpm_cap":  bpm_cap,
+            "too_long": too_long,
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # Persistence
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1167,6 +1473,9 @@ def create_playlist(result: dict, params: dict, name: Optional[str] = None) -> d
             "section":       t.get("section", ""),
             "section_label": t.get("section_label", ""),
             "section_emoji": t.get("section_emoji", ""),
+            # Only set by plan_nights(): "core" up to the planned end of the
+            # night, "reserva" for the overflow tail.
+            "phase":         t.get("phase", ""),
             "spotify_url":   t.get("spotify_url", ""),
             "image_url":     t.get("image_url", ""),
         })
