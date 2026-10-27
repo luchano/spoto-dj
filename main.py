@@ -10,7 +10,7 @@ from typing import Optional
 import httpx
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from analysis import load_cache, save_cache, analyze_track as _yt_analyze
@@ -81,8 +81,33 @@ _analysis_state: dict = {
     "last_done": None,    # {title, bpm, finished: epoch}
 }
 
+class RevalidatingStaticFiles(StaticFiles):
+    """StaticFiles that makes the browser revalidate before reusing a file.
+
+    Starlette sends last-modified and etag but no Cache-Control, so browsers
+    fall back to HEURISTIC freshness: for a file last modified months ago they
+    will happily serve their copy for days without asking us at all.
+
+    That is not academic — it cost a working session. Two branches of this app
+    ran on the same http://127.0.0.1:8000 (one in the main checkout, one in a
+    worktree), and `index.html` is re-read per request while `/static/app.js`
+    was not: the browser paired the NEW html with the OLD js, so the page grew
+    a button whose click handler did not exist and the console threw a bare
+    ReferenceError. Not one /static/ request reached the server to show it.
+
+    "no-cache" does not mean "do not store" — it means revalidate first. The
+    ETag still answers 304 and an unchanged file is never re-downloaded, so
+    this costs one conditional request per file per load and buys correctness.
+    """
+
+    def file_response(self, *args, **kwargs) -> Response:
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "no-cache"
+        return response
+
+
 static_dir = Path(__file__).parent / "static"
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
+app.mount("/static", RevalidatingStaticFiles(directory=static_dir), name="static")
 
 # Error prefixes that are permanent (not transient) — safe to cache so we don't
 # waste API calls retrying them. Defined at module level so _lookup() can use it.
